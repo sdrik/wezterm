@@ -27,8 +27,8 @@ jobs:
     steps:
       - uses: actions/stale@v9.1.0
         with:
-          only-labels: "status: waiting-on-op"
-          labels-to-remove-when-unstale: "status: waiting-on-op"
+          only-labels: waiting-on-op
+          labels-to-remove-when-unstale: waiting-on-op
           days-before-stale: -1
           days-before-close: -1
           days-before-issue-stale: 14

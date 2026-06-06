@@ -4,6 +4,11 @@ import sys
 import glob
 from copy import deepcopy
 
+# The build from this target will be pushed to the gemfury APT repo
+GEMFURY_TARGET = "ubuntu:22.04"
+# The build from this target will be baked into the AppImage
+APPIMAGE_TARGET = "ubuntu:24.04"
+
 TRIGGER_PATHS = [
     "**/*.rs",
     "**/Cargo.lock",
@@ -182,7 +187,6 @@ class Target(object):
         bootstrap_git=False,
         rust_target=None,
         continuous_only=False,
-        app_image=False,
         is_tag=False,
     ):
         if not name:
@@ -196,7 +200,7 @@ class Target(object):
         self.bootstrap_git = bootstrap_git
         self.rust_target = rust_target
         self.continuous_only = continuous_only
-        self.app_image = app_image
+        self.app_image = container == APPIMAGE_TARGET
         self.env = {}
         self.is_tag = is_tag
 
@@ -627,7 +631,7 @@ rustup default {toolchain}
         patterns.append("*.sha256")
         glob = " ".join(patterns)
 
-        if self.container == "ubuntu:22.04":
+        if self.container == GEMFURY_TARGET:
             steps += [
                 RunStep(
                     "Upload to gemfury",
@@ -662,7 +666,7 @@ rustup default {toolchain}
         patterns.append("*.sha256")
         glob = " ".join(patterns)
 
-        if self.container == "ubuntu:22.04":
+        if self.container == GEMFURY_TARGET:
             steps += [
                 RunStep(
                     "Upload to gemfury",
@@ -1013,11 +1017,18 @@ TARGETS = [
 
 
 def generate_actions(namer, jobber, trigger, is_continuous, is_tag=False):
+    have_gemfury = False
+    have_appimage = False
     for t in TARGETS:
         # Clone the definition, as some Target methods called
         # in the body below have side effects that we don't
         # want to bleed across into different schedule types
         t = deepcopy(t)
+
+        if t.app_image:
+            have_appimage = True
+        if t.container == GEMFURY_TARGET:
+            have_gemfury = True
 
         t.is_tag = is_tag
         # if t.continuous_only and not is_continuous:
@@ -1092,6 +1103,10 @@ jobs:
                 yaml.safe_load(f)
         except ImportError:
             pass
+    if not have_appimage:
+        raise NotImplementedError("no appimage target is present")
+    if not have_gemfury:
+        raise NotImplementedError("no gemfury target is present")
 
 
 def generate_pr_actions():

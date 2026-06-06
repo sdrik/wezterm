@@ -644,7 +644,7 @@ rustup default {toolchain}
         return [
             ActionStep(
                 "Download artifact",
-                action="actions/download-artifact@v5",
+                action="actions/download-artifact@v8",
                 params={"name": self.name},
             ),
             checksum,
@@ -679,7 +679,7 @@ rustup default {toolchain}
         return steps + [
             ActionStep(
                 "Download artifact",
-                action="actions/download-artifact@v5",
+                action="actions/download-artifact@v8",
                 params={"name": self.name},
             ),
             checksum,

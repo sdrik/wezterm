@@ -139,7 +139,7 @@ jobs:
           commit_message: "Automated update to match latest tag"
           repository: "linuxbrew-wezterm"
       - name: "Download artifact"
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           name: "ubuntu24.04"
       - name: "Checksum"

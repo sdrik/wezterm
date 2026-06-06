@@ -16,6 +16,7 @@ if test -e /etc/os-release; then
   . /etc/os-release
 fi
 
+echo "OSTYPE is $OSTYPE"
 
 case $OSTYPE in
   darwin*)

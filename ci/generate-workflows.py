@@ -145,11 +145,7 @@ class CheckoutStep(ActionStep):
         params = {}
         if submodules:
             params["submodules"] = "recursive"
-        # Newer versions of the checkout action use a binary-incompatible node
-        # binary, so we are pinned back on v3
-        # https://github.com/actions/checkout/issues/1442
-        version = "v3" if container is not None and "centos7" in container else "v4"
-        super().__init__(name, action=f"actions/checkout@{version}", params=params)
+        super().__init__(name, action=f"actions/checkout@v5", params=params)
 
 
 class InstallCrateStep(ActionStep):
@@ -643,7 +639,7 @@ rustup default {toolchain}
         return [
             ActionStep(
                 "Download artifact",
-                action="actions/download-artifact@v4",
+                action="actions/download-artifact@v5",
                 params={"name": self.name},
             ),
             checksum,
@@ -678,7 +674,7 @@ rustup default {toolchain}
         return steps + [
             ActionStep(
                 "Download artifact",
-                action="actions/download-artifact@v4",
+                action="actions/download-artifact@v5",
                 params={"name": self.name},
             ),
             checksum,
@@ -704,7 +700,7 @@ rustup default {toolchain}
         return [
             ActionStep(
                 "Checkout flathub/org.wezfurlong.wezterm",
-                action="actions/checkout@v4",
+                action="actions/checkout@v5",
                 params={
                     "repository": "flathub/org.wezfurlong.wezterm",
                     "path": "flathub",
@@ -730,7 +726,7 @@ rustup default {toolchain}
             steps += [
                 ActionStep(
                     "Checkout winget-pkgs",
-                    action="actions/checkout@v4",
+                    action="actions/checkout@v5",
                     params={
                         "repository": "wez/winget-pkgs",
                         "path": "winget-pkgs",
@@ -766,7 +762,7 @@ rustup default {toolchain}
             steps += [
                 ActionStep(
                     "Checkout homebrew tap",
-                    action="actions/checkout@v4",
+                    action="actions/checkout@v5",
                     params={
                         "repository": "wez/homebrew-wezterm",
                         "path": "homebrew-wezterm",
@@ -790,7 +786,7 @@ rustup default {toolchain}
             steps += [
                 ActionStep(
                     "Checkout linuxbrew tap",
-                    action="actions/checkout@v4",
+                    action="actions/checkout@v5",
                     params={
                         "repository": "wez/homebrew-wezterm-linuxbrew",
                         "path": "linuxbrew-wezterm",
@@ -1001,20 +997,12 @@ rustup default {toolchain}
 
 
 TARGETS = [
-    Target(container="ubuntu:20.04", continuous_only=True, app_image=True),
     Target(container="ubuntu:22.04", continuous_only=True),
     Target(container="ubuntu:24.04", continuous_only=True),
-    # debian 8's wayland libraries are too old for wayland-client
-    # Target(container="debian:8.11", continuous_only=True, bootstrap_git=True),
-    # harfbuzz's C++ is too new for debian 9's toolchain
-    # Target(container="debian:9.12", continuous_only=True, bootstrap_git=True),
-    Target(container="debian:11", continuous_only=True),
     Target(container="debian:12", continuous_only=True),
     Target(name="centos9", container="quay.io/centos/centos:stream9"),
     Target(name="macos", os="macos-latest"),
     # https://fedoraproject.org/wiki/End_of_life?rd=LifeCycle/EOL
-    Target(container="fedora:39"),
-    Target(container="fedora:40"),
     Target(container="fedora:41"),
     # Target(container="alpine:3.15"),
 

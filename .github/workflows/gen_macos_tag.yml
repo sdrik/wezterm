@@ -17,7 +17,7 @@ jobs:
 
     steps:
       - name: "checkout repo"
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           submodules: "recursive"
       - name: "Install Rust (ARM)"
@@ -101,9 +101,9 @@ jobs:
 
     steps:
       - name: "checkout repo"
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: "Checkout homebrew tap"
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: "wez/homebrew-wezterm"
           path: "homebrew-wezterm"
@@ -117,7 +117,7 @@ jobs:
           commit_message: "Automated update to match latest tag"
           repository: "homebrew-wezterm"
       - name: "Download artifact"
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: "macos"
       - name: "Checksum"

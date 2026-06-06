@@ -553,7 +553,7 @@ rustup default {toolchain}
         return steps + [
             ActionStep(
                 "Upload artifact",
-                action="actions/upload-artifact@v4",
+                action="actions/upload-artifact@v7",
                 params={"name": self.name, "path": paths},
             ),
         ]
@@ -615,7 +615,7 @@ rustup default {toolchain}
         return steps + [
             ActionStep(
                 "Upload artifact",
-                action="actions/upload-artifact@v4",
+                action="actions/upload-artifact@v7",
                 params={"name": self.name, "path": paths, "retention-days": 5},
             ),
         ]

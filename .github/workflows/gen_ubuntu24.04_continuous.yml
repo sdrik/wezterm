@@ -114,6 +114,9 @@ jobs:
       - name: "Install libfuse2"
         shell: bash
         run: "apt-get install -y libfuse2"
+      - name: "Install file"
+        shell: bash
+        run: "apt-get install -y file"
       - name: "Source Tarball"
         shell: bash
         run: "bash ci/source-archive.sh"

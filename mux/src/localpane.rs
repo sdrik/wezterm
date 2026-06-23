@@ -223,6 +223,10 @@ impl Pane for LocalPane {
         self.terminal.lock().user_vars().clone()
     }
 
+    fn set_user_var(&self, name: String, value: String) {
+        self.terminal.lock().set_user_var(name, value);
+    }
+
     fn exit_behavior(&self) -> Option<ExitBehavior> {
         // If we are ssh, and we've not yet fully connected,
         // then override exit_behavior so that we can show

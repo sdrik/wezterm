@@ -965,6 +965,17 @@ impl TerminalState {
         &self.user_vars
     }
 
+    /// Set a user var programmatically, as if the application had emitted an
+    /// OSC 1337 SetUserVar sequence. Updates the stored value and fires a
+    /// `SetUserVar` alert (which surfaces the `user-var-changed` event and a
+    /// title/status redraw).
+    pub fn set_user_var(&mut self, name: String, value: String) {
+        self.user_vars.insert(name.clone(), value.clone());
+        if let Some(handler) = self.alert_handler.as_mut() {
+            handler.alert(Alert::SetUserVar { name, value });
+        }
+    }
+
     fn clear_semantic_attribute_due_to_movement(&mut self) {
         if self.clear_semantic_attribute_on_newline {
             self.clear_semantic_attribute_on_newline = false;

@@ -103,7 +103,23 @@ pub enum Event {
         session: TmuxSessionId,
         window: TmuxWindowId,
     },
-    SubscriptionChanged,
+    /// A `%subscription-changed` notification carrying the latest value of a
+    /// format string we subscribed to via `refresh-client -B`.
+    ///
+    /// The wire format is:
+    /// `%subscription-changed <name> <session-id> <window-id|-> <window-index|-> <pane-id|-> : <value>`
+    /// where the id/index fields are `-` when not applicable to the
+    /// subscription's target (e.g. a session-scoped subscription has no
+    /// window/pane). The id fields are parsed best-effort so that a malformed
+    /// or future-extended notification never fails the whole parse.
+    SubscriptionChanged {
+        name: String,
+        session: Option<TmuxSessionId>,
+        window: Option<TmuxWindowId>,
+        window_index: Option<u64>,
+        pane: Option<TmuxPaneId>,
+        value: String,
+    },
     UnlinkedWindowAdd {
         window: TmuxWindowId,
     },
@@ -193,6 +209,49 @@ fn parse_session_id(pair: Pair<Rule>) -> Result<TmuxSessionId> {
             "parse_session_id can only parse Rule::session_id, got {:?}",
             pair
         ),
+    }
+}
+
+/// Parse the body of a `%subscription-changed` notification (everything after
+/// the `%subscription-changed ` prefix).
+///
+/// Example bodies:
+///   `tmux_status_left $1 - - - : [main] 12:00`        (session-scoped)
+///   `tmux_pane_title $1 @2 3 %4 : vim ~/src`          (pane-scoped)
+///
+/// The header (everything before the first ` : `) is split on whitespace into
+/// the subscription name and the id/index fields; the value is the remainder
+/// after ` : ` and may be empty. Parsing is best-effort: unrecognised id fields
+/// simply become `None` rather than erroring.
+fn parse_subscription_changed(body: &str) -> Event {
+    let (header, value) = match body.split_once(" : ") {
+        Some((header, value)) => (header, value.to_string()),
+        None => (body, String::new()),
+    };
+
+    let mut fields = header.split(' ');
+    let name = fields.next().unwrap_or("").to_string();
+    let session = fields
+        .next()
+        .and_then(|s| s.strip_prefix('$'))
+        .and_then(|n| n.parse().ok());
+    let window = fields
+        .next()
+        .and_then(|s| s.strip_prefix('@'))
+        .and_then(|n| n.parse().ok());
+    let window_index = fields.next().and_then(|s| s.parse().ok());
+    let pane = fields
+        .next()
+        .and_then(|s| s.strip_prefix('%'))
+        .and_then(|n| n.parse().ok());
+
+    Event::SubscriptionChanged {
+        name,
+        session,
+        window,
+        window_index,
+        pane,
+        value,
     }
 }
 
@@ -424,7 +483,14 @@ fn parse_line(line: &[u8]) -> Result<Event> {
             Ok(Event::SessionWindowChanged { session, window })
         }
         Rule::sessions_changed => Ok(Event::SessionsChanged),
-        Rule::subscription_changed => Ok(Event::SubscriptionChanged),
+        Rule::subscription_changed => {
+            let body = pair
+                .into_inner()
+                .next()
+                .ok_or_else(|| format_err!("missing subscription body"))?
+                .as_str();
+            Ok(parse_subscription_changed(body))
+        }
         Rule::unlinked_window_add => {
             let mut pairs = pair.into_inner();
             let window = parse_window_id(
@@ -1043,7 +1109,7 @@ here
 %paste-buffer-changed just something
 %paste-buffer-deleted just something else
 %pause %3
-%subscription-changed something we don't handle so far
+%subscription-changed tmux_pane_title $1 @2 3 %4 : vim ~/src
 ";
 
         let mut p = Parser::new();
@@ -1139,9 +1205,72 @@ here
                     buffer: "just something else".to_owned()
                 },
                 Event::Pause { pane: 3 },
-                Event::SubscriptionChanged,
+                Event::SubscriptionChanged {
+                    name: "tmux_pane_title".to_owned(),
+                    session: Some(1),
+                    window: Some(2),
+                    window_index: Some(3),
+                    pane: Some(4),
+                    value: "vim ~/src".to_owned(),
+                },
             ],
             events
+        );
+    }
+
+    #[test]
+    fn test_parse_subscription_changed() {
+        // pane-scoped: all fields populated
+        assert_eq!(
+            Event::SubscriptionChanged {
+                name: "tmux_pane_current_path".to_owned(),
+                session: Some(1),
+                window: Some(2),
+                window_index: Some(3),
+                pane: Some(4),
+                value: "/home/wez/src".to_owned(),
+            },
+            parse_line(b"%subscription-changed tmux_pane_current_path $1 @2 3 %4 : /home/wez/src")
+                .unwrap()
+        );
+
+        // session-scoped: window/index/pane are `-`
+        assert_eq!(
+            Event::SubscriptionChanged {
+                name: "tmux_status_left".to_owned(),
+                session: Some(1),
+                window: None,
+                window_index: None,
+                pane: None,
+                value: "[main] 12:00".to_owned(),
+            },
+            parse_line(b"%subscription-changed tmux_status_left $1 - - - : [main] 12:00").unwrap()
+        );
+
+        // empty value (note the trailing space before the empty value)
+        assert_eq!(
+            Event::SubscriptionChanged {
+                name: "tmux_status_right".to_owned(),
+                session: Some(1),
+                window: None,
+                window_index: None,
+                pane: None,
+                value: "".to_owned(),
+            },
+            parse_line(b"%subscription-changed tmux_status_right $1 - - - : ").unwrap()
+        );
+
+        // value containing a colon must be preserved intact
+        assert_eq!(
+            Event::SubscriptionChanged {
+                name: "tmux_status_left".to_owned(),
+                session: Some(1),
+                window: None,
+                window_index: None,
+                pane: None,
+                value: "12:34:56".to_owned(),
+            },
+            parse_line(b"%subscription-changed tmux_status_left $1 - - - : 12:34:56").unwrap()
         );
     }
 

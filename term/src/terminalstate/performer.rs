@@ -827,10 +827,7 @@ impl<'a> Performer<'a> {
                 }
                 ITermProprietary::File(image) => self.set_image(*image),
                 ITermProprietary::SetUserVar { name, value } => {
-                    self.user_vars.insert(name.clone(), value.clone());
-                    if let Some(handler) = self.alert_handler.as_mut() {
-                        handler.alert(Alert::SetUserVar { name, value });
-                    }
+                    self.set_user_var(name, value);
                 }
                 ITermProprietary::UnicodeVersion(ITermUnicodeVersionOp::Set(n)) => {
                     self.unicode_version.version = n;

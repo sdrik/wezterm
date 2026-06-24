@@ -49,20 +49,27 @@ are silently skipped; everything else continues to work.
 
 ## Example: show tmux's status-left in the wezterm status bar
 
+The value of `#{T:status-left}` / `#{T:status-right}` contains tmux's own style
+markup (e.g. `#[fg=green]`). Use
+[wezterm.format_items_from_tmux](../wezterm/format_items_from_tmux.md) to render
+it as styled text:
+
 ```lua
 local wezterm = require 'wezterm'
 local config = wezterm.config_builder()
 
 wezterm.on('update-status', function(window, pane)
   local vars = pane:get_user_vars()
-  window:set_left_status(vars.tmux_status_left or '')
-  window:set_right_status(vars.tmux_status_right or '')
+  window:set_left_status(
+    wezterm.format(wezterm.format_items_from_tmux(vars.tmux_status_left or ''))
+  )
+  window:set_right_status(
+    wezterm.format(wezterm.format_items_from_tmux(vars.tmux_status_right or ''))
+  )
 end)
 
 return config
 ```
 
-!!! note
-    The value of `#{T:status-left}` / `#{T:status-right}` contains tmux's own
-    style markup (e.g. `#[fg=green]`) literally; wezterm does not interpret it.
-    Strip or translate it on the Lua side if you don't want it shown verbatim.
+To show the raw value instead (tags included), pass the user var straight to
+`window:set_left_status(vars.tmux_status_left or '')`.

@@ -54,7 +54,11 @@ are silently skipped; everything else continues to work.
 
 Handle the
 [tmux-subscription-changed](../window-events/tmux-subscription-changed.md) event
-and keep the latest values in your own Lua state:
+and keep the latest values in your own Lua state. The value of
+`#{T:status-left}` / `#{T:status-right}` contains tmux's own style markup (e.g.
+`#[fg=green]`), so use
+[wezterm.format_items_from_tmux](../wezterm/format_items_from_tmux.md) to render
+it as styled text:
 
 ```lua
 local wezterm = require 'wezterm'
@@ -72,14 +76,16 @@ wezterm.on('tmux-subscription-changed', function(window, pane, name, value, meta
   local id = window:window_id()
   tmux_status[id] = tmux_status[id] or {}
   tmux_status[id][name] = value
-  window:set_left_status(tmux_status[id].status_left or '')
-  window:set_right_status(tmux_status[id].status_right or '')
+  window:set_left_status(
+    wezterm.format(wezterm.format_items_from_tmux(tmux_status[id].status_left or ''))
+  )
+  window:set_right_status(
+    wezterm.format(wezterm.format_items_from_tmux(tmux_status[id].status_right or ''))
+  )
 end)
 
 return config
 ```
 
-!!! note
-    The value of `#{T:status-left}` / `#{T:status-right}` contains tmux's own
-    style markup (e.g. `#[fg=green]`) literally; wezterm does not interpret it.
-    Strip or translate it on the Lua side if you don't want it shown verbatim.
+To show the raw value instead (tags included), pass it straight to
+`window:set_left_status(value)`.

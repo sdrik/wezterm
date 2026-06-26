@@ -1165,6 +1165,36 @@ impl TmuxCommand for SelectPane {
     }
 }
 
+/// Inject an arbitrary tmux command line into the -CC control stream. Used by
+/// the `TmuxSendCommand` key assignment so that WezTerm can trigger tmux key
+/// bindings (which are otherwise bypassed in control mode) via e.g.
+/// `send-keys -K <chord>`. Fire-and-forget: the `%begin/%end` guard is still
+/// consumed by `process_result`, but errors are only logged, never bubbled up.
+#[derive(Debug)]
+pub(crate) struct RawCommand {
+    pub command: String,
+}
+
+impl TmuxCommand for RawCommand {
+    fn get_command(&self, _domain_id: DomainId) -> String {
+        if self.command.ends_with('\n') {
+            self.command.clone()
+        } else {
+            format!("{}\n", self.command)
+        }
+    }
+
+    fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()> {
+        if result.error {
+            log::warn!(
+                "RawCommand {:?} in domain={domain_id} returned an error: {result:#?}",
+                self.command
+            );
+        }
+        Ok(())
+    }
+}
+
 // This is a dummy command which indicates the attaching is done, it prevents the tmux output
 // the unexpected and unnecessary content when syncing with back end in attaching stage.
 #[derive(Debug)]

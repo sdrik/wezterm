@@ -554,6 +554,7 @@ pub enum KeyAssignment {
     ActivateTab(isize),
     ActivateLastTab,
     SendString(String),
+    TmuxSendCommand(String),
     SendKey(KeyNoAction),
     Nop,
     DisableDefaultAssignment,

@@ -2744,6 +2744,16 @@ impl TermWindow {
                 self.activate_window_relative(*n, false)?;
             }
             SendString(s) => pane.writer().write_all(s.as_bytes())?,
+            TmuxSendCommand(cmd) => {
+                let domain_id = pane.domain_id();
+                if let Some(domain) = Mux::get().get_domain(domain_id) {
+                    if let Some(tmux) = domain.downcast_ref::<::mux::tmux::TmuxDomain>() {
+                        tmux.send_raw_command(cmd.clone());
+                    } else {
+                        log::warn!("TmuxSendCommand: active pane is not in a tmux (-CC) domain");
+                    }
+                }
+            }
             SendKey(key) => {
                 use keyevent::Key;
                 let mods = key.mods;

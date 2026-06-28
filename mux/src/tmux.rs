@@ -89,6 +89,12 @@ pub(crate) struct TmuxDomainState {
     /// Set when a global prune of dead panes has been scheduled but not yet run;
     /// coalesces multiple requests into a single quiescent prune.
     pub(crate) prune_pending: AtomicBool,
+    /// Latest value of each session/window-scoped format subscription (i.e.
+    /// notifications not tied to a specific pane), keyed by subscription name.
+    /// tmux only emits `%subscription-changed` on change, so panes created
+    /// later must be seeded from this cache to show the current value before
+    /// the next change. See `create_pane`.
+    pub session_format_values: Mutex<HashMap<String, String>>,
 }
 
 pub struct TmuxDomain {
@@ -258,6 +264,41 @@ impl TmuxDomainState {
                 Event::UnlinkedWindowClose { window } => {
                     let _ = self.remove_detached_window(*window);
                     self.schedule_prune();
+                }
+                Event::SubscriptionChanged {
+                    name, pane, value, ..
+                } => {
+                    // Collect the target local pane ids first, so we don't hold
+                    // the remote_panes lock while calling set_user_var (which
+                    // locks the pane's terminal).
+                    let targets: Vec<PaneId> = {
+                        let pane_map = self.remote_panes.lock();
+                        match pane {
+                            // Pane-scoped: update just the mapped local pane.
+                            Some(tmux_pane) => pane_map
+                                .get(tmux_pane)
+                                .map(|p| vec![p.lock().local_pane_id])
+                                .unwrap_or_default(),
+                            // Session/window-scoped: no single pane, so expose
+                            // the value on every pane in this domain (robust to
+                            // the active pane changing).
+                            None => pane_map.values().map(|p| p.lock().local_pane_id).collect(),
+                        }
+                    };
+                    // Cache session/window-scoped values so panes created later
+                    // (e.g. a new tab) can be seeded immediately rather than
+                    // waiting for the next change notification.
+                    if pane.is_none() {
+                        self.session_format_values
+                            .lock()
+                            .insert(name.clone(), value.clone());
+                    }
+                    let mux = Mux::get();
+                    for local_pane_id in targets {
+                        if let Some(p) = mux.get_pane(local_pane_id) {
+                            p.set_user_var(name.clone(), value.clone());
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -430,6 +471,7 @@ impl TmuxDomain {
             pending_splits: Mutex::new(VecDeque::default()),
             backlog: Mutex::new(HashMap::default()),
             prune_pending: AtomicBool::new(false),
+            session_format_values: Mutex::new(HashMap::default()),
         });
 
         Self { inner }

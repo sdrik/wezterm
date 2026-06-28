@@ -17,6 +17,7 @@ use crate::keys::{Key, LeaderKey, Mouse};
 use crate::lua::make_lua_context;
 use crate::ssh::{SshBackend, SshDomain};
 use crate::tls::{TlsDomainClient, TlsDomainServer};
+use crate::tmux::TmuxFormatSubscription;
 use crate::units::Dimension;
 use crate::unix::UnixDomain;
 use crate::wsl::WslDomain;
@@ -360,6 +361,12 @@ pub struct Config {
 
     #[dynamic(default)]
     pub exec_domains: Vec<ExecDomain>,
+
+    /// The set of tmux control-mode format strings to subscribe to when
+    /// attached to a `tmux -CC` session. Each subscription's latest value is
+    /// exposed as a user var (named by `name`) on the relevant pane(s).
+    #[dynamic(default = "default_tmux_format_subscriptions")]
+    pub tmux_format_subscriptions: Vec<TmuxFormatSubscription>,
 
     #[dynamic(default)]
     pub serial_ports: Vec<SerialDomain>,
@@ -1629,6 +1636,32 @@ fn default_pane_select_font_size() -> f64 {
 fn default_integrated_title_buttons() -> Vec<IntegratedTitleButton> {
     use IntegratedTitleButton::*;
     vec![Hide, Maximize, Close]
+}
+
+fn default_tmux_format_subscriptions() -> Vec<TmuxFormatSubscription> {
+    use crate::tmux::TmuxSubscriptionTarget::{Pane, Session};
+    vec![
+        TmuxFormatSubscription {
+            name: "tmux_status_left".to_string(),
+            target: Session,
+            format: "#{T:status-left}".to_string(),
+        },
+        TmuxFormatSubscription {
+            name: "tmux_status_right".to_string(),
+            target: Session,
+            format: "#{T:status-right}".to_string(),
+        },
+        TmuxFormatSubscription {
+            name: "tmux_pane_current_path".to_string(),
+            target: Pane,
+            format: "#{pane_current_path}".to_string(),
+        },
+        TmuxFormatSubscription {
+            name: "tmux_pane_title".to_string(),
+            target: Pane,
+            format: "#{pane_title}".to_string(),
+        },
+    ]
 }
 
 fn default_char_select_font_size() -> f64 {

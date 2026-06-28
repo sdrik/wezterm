@@ -11,10 +11,16 @@ use termwiz::surface::change::Change;
 use termwiz::surface::Line;
 use wezterm_dynamic::{FromDynamic, ToDynamic};
 
+mod tmux_style;
+
 pub fn register(lua: &Lua) -> anyhow::Result<()> {
     let wezterm_mod = get_or_create_module(lua, "wezterm")?;
     wezterm_mod.set("nerdfonts", NerdFonts {})?;
     wezterm_mod.set("format", lua.create_function(format)?)?;
+    wezterm_mod.set(
+        "format_items_from_tmux",
+        lua.create_function(format_items_from_tmux)?,
+    )?;
     wezterm_mod.set(
         "column_width",
         lua.create_function(|_, s: String| Ok(unicode_column_width(&s, None)))?,
@@ -145,6 +151,12 @@ pub fn format_as_escapes(items: Vec<FormatItem>) -> anyhow::Result<String> {
 
 fn format<'lua>(_: &'lua Lua, items: Vec<FormatItem>) -> mlua::Result<String> {
     format_as_escapes(items).map_err(mlua::Error::external)
+}
+
+/// Parse a tmux style string (containing `#[...]` directives) into a list of
+/// format items, suitable for passing to `wezterm.format`.
+fn format_items_from_tmux<'lua>(_: &'lua Lua, input: String) -> mlua::Result<Vec<FormatItem>> {
+    Ok(tmux_style::tmux_style_to_format_items(&input))
 }
 
 pub fn pad_right(mut result: String, width: usize) -> String {

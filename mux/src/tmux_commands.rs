@@ -149,7 +149,7 @@ impl TmuxDomainState {
             Box::new(writer.clone()),
         );
 
-        Ok(Arc::new(LocalPane::new(
+        let local_pane: Arc<dyn Pane> = Arc::new(LocalPane::new(
             local_pane_id,
             terminal,
             Box::new(child),
@@ -157,7 +157,23 @@ impl TmuxDomainState {
             Box::new(writer),
             self.domain_id,
             "tmux pane".to_string(),
-        )))
+        ));
+
+        // Seed session/window-scoped format subscription values so this pane
+        // shows the current value immediately. tmux only re-emits these on
+        // change, so without this a new tab would have empty values until the
+        // next change (e.g. up to a minute for a clock in status-left).
+        let seed: Vec<(String, String)> = self
+            .session_format_values
+            .lock()
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        for (name, value) in seed {
+            local_pane.set_user_var(name, value);
+        }
+
+        Ok(local_pane)
     }
 
     /// Apply a parsed tmux window layout to the corresponding local tab,
@@ -1158,6 +1174,45 @@ impl TmuxCommand for ListCommands {
     }
 }
 
+/// Register tmux control-mode format subscriptions via `refresh-client -B`.
+///
+/// All subscriptions are registered in a single `refresh-client` invocation
+/// (multiple `-B` flags) so this remains one command / one response in the
+/// queue. Each `-B` argument is `name:what:format`; the format is single-quoted
+/// so tmux's command parser passes it through literally (refresh-client expands
+/// it itself, per subscription) rather than expanding `#{...}` at parse time.
+#[derive(Debug)]
+pub(crate) struct Subscribe {
+    pub subs: Vec<config::TmuxFormatSubscription>,
+}
+
+impl TmuxCommand for Subscribe {
+    fn get_command(&self, _domain_id: DomainId) -> String {
+        let mut cmd = String::from("refresh-client");
+        for sub in &self.subs {
+            let arg = format!("{}:{}:{}", sub.name, sub.target.tmux_type(), sub.format);
+            // tmux treats everything inside single quotes literally; represent
+            // an embedded single quote with the close/escape/reopen idiom.
+            let arg = arg.replace('\'', "'\\''");
+            let _ = write!(cmd, " -B '{arg}'");
+        }
+        cmd.push('\n');
+        cmd
+    }
+
+    fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()> {
+        if result.error {
+            // tmux < 3.2, or a format string tmux rejected. Degrade gracefully:
+            // log and keep the control-mode session running.
+            log::warn!(
+                "tmux format subscriptions in domain={domain_id} were rejected \
+                 (requires tmux >= 3.2): {result:#?}"
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct SplitPane {
     pub pane_id: TmuxPaneId,
@@ -1279,8 +1334,36 @@ impl TmuxCommand for AttachDone {
             None => anyhow::bail!("Tmux domain lost"),
         };
 
-        // Do nothing, just change the state.
         *tmux_domain.inner.attach_state.lock() = AttachState::Done;
+
+        // Now that the attach is complete and all panes are mapped, register
+        // tmux format subscriptions (if this tmux supports them). Subscribing
+        // here ensures the initial values land on already-attached panes.
+        // tmux's `%*` / `@*` targets also cover panes/windows created later, so
+        // a single registration per attach is sufficient.
+        let supports_subscribe = tmux_domain
+            .inner
+            .support_commands
+            .lock()
+            .get("refresh-client")
+            .map_or(false, |usage| usage.contains("-B"));
+        if supports_subscribe {
+            let subs = config::configuration().tmux_format_subscriptions.clone();
+            if !subs.is_empty() {
+                tmux_domain
+                    .inner
+                    .cmd_queue
+                    .as_ref()
+                    .lock()
+                    .push_back(Box::new(Subscribe { subs }));
+                TmuxDomainState::schedule_send_next_command(domain_id);
+            }
+        } else {
+            log::info!(
+                "tmux in domain={domain_id} does not support format subscriptions \
+                 (refresh-client -B); skipping"
+            );
+        }
         Ok(())
     }
 }

@@ -262,6 +262,12 @@ pub trait Pane: Downcast + Send + Sync {
         HashMap::new()
     }
 
+    /// Set a user var on this pane programmatically (rather than via an OSC
+    /// 1337 SetUserVar sequence). Used e.g. by the tmux integration to surface
+    /// tmux-computed format values. The default is a no-op for pane types that
+    /// don't support user vars.
+    fn set_user_var(&self, _name: String, _value: String) {}
+
     fn erase_scrollback(&self, _erase_mode: ScrollbackEraseMode) {}
 
     /// Called to advise on whether this tab has focus

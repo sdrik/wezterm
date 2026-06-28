@@ -75,6 +75,15 @@ As features stabilize some brief notes about them will accumulate here.
   easier to spot the remaining candidates. Thanks to @mr-felixoid and @bew! #7752
 
 #### New
+* [wezterm.format_items_from_tmux](config/lua/wezterm/format_items_from_tmux.md):
+  parses a tmux `#[...]` style string into format items for `wezterm.format`, so
+  styled tmux content (e.g. `#{T:status-left}`) can be rendered in the wezterm
+  status bar.
+* [tmux_format_subscriptions](config/lua/config/tmux_format_subscriptions.md):
+  when attached to a `tmux -CC` session (tmux >= 3.2), wezterm now subscribes to
+  tmux format strings (e.g. `#{T:status-left}`, `#{pane_current_path}`) and
+  exposes their tmux-computed values as pane user vars, so they can be shown in
+  the wezterm status bar from an `update-status` handler.
 * [wezterm.serde](config/lua/wezterm.serde/index.md) module for serialization
   and deserialization of JSON, TOML and YAML. Thanks to @expnn! #4969
 * `wezterm ssh` now supports agent forwarding. Thanks to @Riatre! #5345

@@ -2,9 +2,7 @@ use crate::activity::Activity;
 use crate::domain::{alloc_domain_id, Domain, DomainId, DomainState, SplitSource};
 use crate::pane::{Pane, PaneId};
 use crate::tab::{SplitRequest, Tab, TabId};
-use crate::tmux_commands::{
-    ListAllPanes, ListAllWindows, ListCommands, NewWindow, SplitPane, TmuxCommand,
-};
+use crate::tmux_commands::{ListAllWindows, ListCommands, NewWindow, SplitPane, TmuxCommand};
 use crate::window::WindowId;
 use crate::{Mux, MuxWindowBuilder};
 use async_trait::async_trait;
@@ -13,6 +11,7 @@ use parking_lot::{Condvar, Mutex};
 use portable_pty::CommandBuilder;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use termwiz::tmux_cc::*;
 use wezterm_term::TerminalSize;
@@ -58,8 +57,14 @@ pub(crate) type RefTmuxRemotePane = Arc<Mutex<TmuxRemotePane>>;
 pub(crate) struct TmuxTab {
     pub tab_id: TabId, // local tab ID
     pub tmux_window_id: TmuxWindowId,
-    pub layout_csum: String,
-    pub panes: HashSet<TmuxPaneId>, // tmux panes within tmux window
+    /// tmux panes currently present in this window, per the last applied layout.
+    pub panes: HashSet<TmuxPaneId>,
+    /// The tmux pane id that is active in this window, tracked from
+    /// `%window-pane-changed` and list-panes; used to mark the active pane when
+    /// (re)building the local tree.
+    pub active_pane: Option<TmuxPaneId>,
+    /// The window's scrollback limit, used when capturing newly discovered panes.
+    pub history_limit: isize,
 }
 
 pub(crate) type TmuxCmdQueue = VecDeque<Box<dyn TmuxCommand>>;
@@ -74,12 +79,29 @@ pub(crate) struct TmuxDomainState {
     pub tmux_session: Mutex<Option<TmuxSessionId>>,
     pub support_commands: Mutex<HashMap<String, String>>,
     pub attach_state: Mutex<AttachState>,
-    pending_splits: Mutex<VecDeque<promise::Promise<TmuxPaneId>>>,
+    /// Promises awaiting the local pane that results from a user-initiated
+    /// split; resolved (FIFO) with the local `PaneId` once the split's
+    /// `%layout-change` creates the pane.
+    pub(crate) pending_splits: Mutex<VecDeque<promise::Promise<PaneId>>>,
     pub backlog: Mutex<HashMap<TmuxPaneId, Vec<u8>>>,
+    /// Set when a global prune of dead panes has been scheduled but not yet run;
+    /// coalesces multiple requests into a single quiescent prune.
+    pub(crate) prune_pending: AtomicBool,
 }
 
 pub struct TmuxDomain {
     pub(crate) inner: Arc<TmuxDomainState>,
+}
+
+/// Resolve the `TmuxDomainState` for `domain_id` and run `f` with it. Used to
+/// hop event handling onto the main thread, where mux mutations are safe.
+fn with_tmux_domain<F: FnOnce(&Arc<TmuxDomainState>)>(domain_id: DomainId, f: F) {
+    let mux = Mux::get();
+    if let Some(domain) = mux.get_domain(domain_id) {
+        if let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() {
+            f(&tmux_domain.inner);
+        }
+    }
 }
 
 impl TmuxDomainState {
@@ -143,19 +165,31 @@ impl TmuxDomainState {
                 Event::LayoutChange {
                     window,
                     layout,
-                    visible_layout: _,
-                    raw_flags: _,
+                    visible_layout,
+                    raw_flags,
                 } => {
-                    let mut cmd_queue = self.cmd_queue.as_ref().lock();
-                    cmd_queue.push_back(Box::new(ListAllPanes {
-                        window_id: *window,
-                        prune: true,
-                        layout_csum: if let Some(l) = layout.get(0..4) {
-                            l.to_string()
-                        } else {
-                            "".to_string()
-                        },
-                    }));
+                    // The remote layout is the source of truth for this window's
+                    // structure. Rebuild the local tab atomically on the main
+                    // thread (it mutates the mux).
+                    let domain_id = self.domain_id;
+                    let window = *window;
+                    let layout = layout.clone();
+                    let visible_layout = visible_layout.clone();
+                    let raw_flags = raw_flags.clone();
+                    promise::spawn::spawn_into_main_thread(async move {
+                        with_tmux_domain(domain_id, |inner| {
+                            if let Err(err) = inner.handle_layout_change(
+                                window,
+                                &layout,
+                                visible_layout.as_deref(),
+                                raw_flags.as_deref(),
+                            ) {
+                                log::error!("tmux layout-change error: {:#}", err);
+                            }
+                            inner.maybe_schedule_send();
+                        });
+                    })
+                    .detach();
                 }
                 Event::Output { pane, text } => {
                     let pane_map = self.remote_panes.lock();
@@ -194,22 +228,21 @@ impl TmuxDomainState {
                 }
                 Event::WindowClose { window } => {
                     let _ = self.remove_detached_window(*window);
+                    self.schedule_prune();
                 }
                 Event::WindowPaneChanged { window, pane } => {
-                    // The tmux 2.7 WindowPaneChanged event comes early than WindowAdd, we need to
-                    // skip it
-                    if !self.check_window_attached(*window) {
-                        continue;
-                    }
-
-                    // Split pane
-                    if !self.check_pane_attached(*window, *pane) {
-                        let mut pending_splits = self.pending_splits.lock();
-                        if let Some(mut promise) = pending_splits.pop_front() {
-                            promise.ok(*pane);
-                        }
-                    }
-                    log::info!("tmux window pane changed: {}:{}", window, pane);
+                    // Track the active pane for this window. The split-completion
+                    // promise is resolved later, when the corresponding
+                    // %layout-change actually creates the local pane.
+                    let domain_id = self.domain_id;
+                    let window = *window;
+                    let pane = *pane;
+                    promise::spawn::spawn_into_main_thread(async move {
+                        with_tmux_domain(domain_id, |inner| {
+                            inner.set_active_tmux_pane(window, pane);
+                        });
+                    })
+                    .detach();
                 }
                 Event::WindowRenamed { window, name } => {
                     let gui_tabs = self.gui_tabs.lock();
@@ -222,6 +255,7 @@ impl TmuxDomainState {
                 }
                 Event::UnlinkedWindowClose { window } => {
                     let _ = self.remove_detached_window(*window);
+                    self.schedule_prune();
                 }
                 _ => {}
             }
@@ -330,6 +364,49 @@ impl TmuxDomainState {
             anyhow::bail!("Could not find the tmux pane peer for local pane: {pane_id}");
         }
     }
+
+    /// True when there are no in-flight commands: the FSM is Idle and the
+    /// command queue is empty. Used to defer the global prune until all the
+    /// consequences of a compound operation (e.g. a cross-window move that
+    /// emits the source and destination layout changes separately) have been
+    /// applied.
+    pub(crate) fn is_quiescent(&self) -> bool {
+        *self.state.lock() == State::Idle && self.cmd_queue.lock().is_empty()
+    }
+
+    /// Schedule sending the next queued command if we are idle and have work.
+    pub(crate) fn maybe_schedule_send(&self) {
+        if *self.state.lock() == State::Idle && !self.cmd_queue.lock().is_empty() {
+            TmuxDomainState::schedule_send_next_command(self.domain_id);
+        }
+    }
+
+    /// Request a global prune of panes that no longer appear in any window.
+    /// Coalesced: at most one prune is in flight, and it only runs once the
+    /// domain is quiescent so that a pane moved between windows (whose source
+    /// and destination `%layout-change` arrive as separate events) is never
+    /// destroyed mid-move.
+    pub(crate) fn schedule_prune(&self) {
+        if self.prune_pending.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        TmuxDomainState::schedule_prune_task(self.domain_id);
+    }
+
+    fn schedule_prune_task(domain_id: DomainId) {
+        promise::spawn::spawn_into_main_thread_with_low_priority(async move {
+            with_tmux_domain(domain_id, |inner| {
+                if !inner.is_quiescent() {
+                    // Not settled yet; retry after pending work drains.
+                    TmuxDomainState::schedule_prune_task(domain_id);
+                    return;
+                }
+                inner.prune_pending.store(false, Ordering::SeqCst);
+                inner.prune_dead_panes();
+            });
+        })
+        .detach();
+    }
 }
 
 impl TmuxDomain {
@@ -350,6 +427,7 @@ impl TmuxDomain {
             attach_state: Mutex::new(AttachState::Init),
             pending_splits: Mutex::new(VecDeque::default()),
             backlog: Mutex::new(HashMap::default()),
+            prune_pending: AtomicBool::new(false),
         });
 
         Self { inner }
@@ -384,20 +462,24 @@ impl Domain for TmuxDomain {
         split_request: SplitRequest,
     ) -> anyhow::Result<Arc<dyn Pane>> {
         let mut promise = promise::Promise::new();
-        if let Some(future) = promise.get_future() {
-            {
-                let mut pending_splits = self.inner.pending_splits.lock();
-                let _ = self.inner.split_tmux_pane(tab, pane_id, split_request)?;
-                pending_splits.push_back(promise);
-            }
-
-            if let Ok(id) = future.await {
-                let pane = self.inner.split_pane(tab, pane_id, id, split_request);
-                return pane;
-            }
+        let future = promise
+            .get_future()
+            .ok_or_else(|| anyhow::anyhow!("failed to create split promise"))?;
+        {
+            let mut pending_splits = self.inner.pending_splits.lock();
+            self.inner.split_tmux_pane(tab, pane_id, split_request)?;
+            pending_splits.push_back(promise);
         }
 
-        anyhow::bail!("Split_pane failed");
+        // The new pane is created by the %layout-change that tmux emits in
+        // response to split-window; that handler resolves this promise with the
+        // newly created local pane id.
+        let local_pane_id = future
+            .await
+            .map_err(|_| anyhow::anyhow!("split-pane was cancelled"))?;
+        Mux::get()
+            .get_pane(local_pane_id)
+            .ok_or_else(|| anyhow::anyhow!("split-pane: created pane vanished"))
     }
 
     async fn spawn_pane(

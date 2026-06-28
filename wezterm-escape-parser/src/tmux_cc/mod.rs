@@ -129,20 +129,88 @@ pub enum Event {
     },
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct PaneLayout {
-    pub pane_id: TmuxPaneId,
-    pub pane_width: u64,
-    pub pane_height: u64,
-    pub pane_left: u64,
-    pub pane_top: u64,
+/// The geometry of a tmux layout cell: its size and position within the
+/// window, in terminal cells. Matches the `WxH,X,Y` portion of a tmux
+/// layout string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TmuxLayoutCell {
+    pub width: u64,
+    pub height: u64,
+    pub left: u64,
+    pub top: u64,
 }
 
-#[derive(Debug)]
-pub enum WindowLayout {
-    SplitVertical(Vec<PaneLayout>),
-    SplitHorizontal(Vec<PaneLayout>),
-    SinglePane(PaneLayout),
+/// The direction along which a tmux split arranges its children.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TmuxSplitDirection {
+    /// `{...}` in the layout string: children are laid out left-to-right.
+    Horizontal,
+    /// `[...]` in the layout string: children are laid out top-to-bottom.
+    Vertical,
+}
+
+/// A faithful, n-ary mirror of tmux's window layout tree, as described by a
+/// tmux layout string (see [`parse_layout_tree`]). A `Split` may have any
+/// number of children (tmux produces 3+ for layouts such as
+/// `even-horizontal`), so this is intentionally n-ary rather than binary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TmuxLayoutNode {
+    Leaf {
+        cell: TmuxLayoutCell,
+        pane_id: TmuxPaneId,
+    },
+    Split {
+        cell: TmuxLayoutCell,
+        direction: TmuxSplitDirection,
+        children: Vec<TmuxLayoutNode>,
+    },
+}
+
+impl TmuxLayoutNode {
+    /// The geometry of this node (its bounding cell), regardless of variant.
+    pub fn cell(&self) -> TmuxLayoutCell {
+        match self {
+            TmuxLayoutNode::Leaf { cell, .. } => *cell,
+            TmuxLayoutNode::Split { cell, .. } => *cell,
+        }
+    }
+
+    /// All pane ids contained in this subtree, in layout order
+    /// (left-to-right within `{}`, top-to-bottom within `[]`).
+    pub fn pane_ids(&self) -> Vec<TmuxPaneId> {
+        let mut out = Vec::new();
+        self.collect_pane_ids(&mut out);
+        out
+    }
+
+    fn collect_pane_ids(&self, out: &mut Vec<TmuxPaneId>) {
+        match self {
+            TmuxLayoutNode::Leaf { pane_id, .. } => out.push(*pane_id),
+            TmuxLayoutNode::Split { children, .. } => {
+                for child in children {
+                    child.collect_pane_ids(out);
+                }
+            }
+        }
+    }
+
+    /// All leaves `(pane_id, cell)` in this subtree, in layout order.
+    pub fn leaves(&self) -> Vec<(TmuxPaneId, TmuxLayoutCell)> {
+        let mut out = Vec::new();
+        self.collect_leaves(&mut out);
+        out
+    }
+
+    fn collect_leaves(&self, out: &mut Vec<(TmuxPaneId, TmuxLayoutCell)>) {
+        match self {
+            TmuxLayoutNode::Leaf { pane_id, cell } => out.push((*pane_id, *cell)),
+            TmuxLayoutNode::Split { children, .. } => {
+                for child in children {
+                    child.collect_leaves(out);
+                }
+            }
+        }
+    }
 }
 
 fn parse_pane_id(pair: Pair<Rule>) -> Result<TmuxPaneId> {
@@ -689,151 +757,110 @@ pub fn unvis(s: &str) -> Result<String> {
         .map_err(|err| format_err!("Unescaped string is not valid UTF8: {}", err))
 }
 
-fn parse_layout_pane(pair: Pair<Rule>) -> Result<PaneLayout> {
-    let mut pairs = pair.into_inner();
-
-    let pane_width = pairs
-        .next()
-        .ok_or_else(|| format_err!("wrong pane layout format"))?
-        .as_str()
-        .parse()?;
-    let pane_height = pairs
-        .next()
-        .ok_or_else(|| format_err!("wrong pane layout format"))?
-        .as_str()
-        .parse()?;
-    let pane_left = pairs
-        .next()
-        .ok_or_else(|| format_err!("wrong pane layout format"))?
-        .as_str()
-        .parse()?;
-    let pane_top = pairs
-        .next()
-        .ok_or_else(|| format_err!("wrong pane layout format"))?
-        .as_str()
-        .parse()?;
-
-    let pane_id = match pairs.next() {
-        Some(x) => x.as_str().parse()?,
-        None => 0,
-    };
-
-    return Ok(PaneLayout {
-        pane_id,
-        pane_width,
-        pane_height,
-        pane_left,
-        pane_top,
-    });
-}
-
-fn parse_layout_inner(
-    mut pairs: Pairs<Rule>,
-    result: &mut Vec<WindowLayout>,
-) -> Result<Vec<PaneLayout>> {
-    let mut stack = Vec::new();
-
-    while let Some(pair) = pairs.next() {
-        let rule = pair.as_rule();
-        match rule {
-            Rule::layout_split_horizontal | Rule::layout_split_vertical => {
-                let mut pairs_inner = pair.into_inner();
-                let pair = pairs_inner
-                    .next()
-                    .ok_or_else(|| format_err!("no pairs!?"))?;
-                let mut pane = parse_layout_pane(pair)?;
-
-                if result.is_empty() {
-                    // Fake one, to flag it is not a TmuxLayout::SinglePane will pop
-                    result.push(WindowLayout::SplitHorizontal(vec![]));
-                }
-
-                let mut layout_inner = parse_layout_inner(pairs_inner, result)?;
-
-                let last_item = layout_inner
-                    .pop()
-                    .ok_or_else(|| format_err!("wrong layout format"))?;
-
-                pane.pane_id = last_item.pane_id;
-
-                layout_inner.insert(0, pane.clone());
-
-                if let Rule::layout_split_horizontal = rule {
-                    result.insert(0, WindowLayout::SplitHorizontal(layout_inner));
-                } else {
-                    result.insert(0, WindowLayout::SplitVertical(layout_inner));
-                }
-
-                stack.push(pane);
-            }
-            Rule::layout_pane => {
-                let pane = parse_layout_pane(pair)?;
-
-                // SinglePane
-                if result.is_empty() {
-                    result.insert(0, WindowLayout::SinglePane(pane));
-                    return Ok(stack);
-                }
-
-                stack.push(pane);
-            }
-            Rule::EOI
-            | Rule::any_text
-            | Rule::begin
-            | Rule::client_detached
-            | Rule::client_name
-            | Rule::client_session_changed
-            | Rule::config_error
-            | Rule::r#continue
-            | Rule::end
-            | Rule::error
-            | Rule::exit
-            | Rule::extended_output
-            | Rule::layout_change
-            | Rule::layout_split_pane
-            | Rule::layout_window
-            | Rule::line
-            | Rule::line_entire
-            | Rule::message
-            | Rule::number
-            | Rule::output
-            | Rule::pane_id
-            | Rule::pane_mode_changed
-            | Rule::paste_buffer_changed
-            | Rule::paste_buffer_deleted
-            | Rule::pause
-            | Rule::session_changed
-            | Rule::session_id
-            | Rule::session_renamed
-            | Rule::session_window_changed
-            | Rule::sessions_changed
-            | Rule::subscription_changed
-            | Rule::unlinked_window_add
-            | Rule::unlinked_window_close
-            | Rule::unlinked_window_renamed
-            | Rule::window_add
-            | Rule::window_close
-            | Rule::window_id
-            | Rule::window_layout
-            | Rule::window_pane_changed
-            | Rule::window_renamed
-            | Rule::word => bail!("Should not reach here"),
+/// tmux prefixes a layout string with a 4 hex digit checksum followed by a
+/// comma (`#{window_layout}` => e.g. `b25d,80x24,0,0,0`). The checksum is a
+/// `%04hx` of a `u16`, so it is always exactly 4 hex digits. A real layout
+/// cell always begins with `WxH` (i.e. contains an `x` before the first
+/// comma), so an all-hex token before the first comma can only be a checksum.
+/// Strip it if present; otherwise return the input unchanged.
+fn strip_layout_checksum(layout: &str) -> &str {
+    if let Some((prefix, rest)) = layout.split_once(',') {
+        if prefix.len() == 4
+            && !rest.is_empty()
+            && prefix.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return rest;
         }
     }
-
-    Ok(stack)
+    layout
 }
 
-pub fn parse_layout(layout: &str) -> Result<Vec<WindowLayout>> {
-    let mut result = Vec::new();
-    let pairs = parser::TmuxParser::parse(Rule::layout_window, layout)?;
+fn parse_layout_u64(pair: Pair<Rule>) -> Result<u64> {
+    pair.as_str()
+        .parse()
+        .map_err(|err| format_err!("invalid number in layout: {}", err))
+}
 
-    let _ = parse_layout_inner(pairs, &mut result)?;
-    if result.len() > 1 {
-        let _ = result.pop();
+/// Read the four `WxH,X,Y` numbers that begin a `layout_pane` or
+/// `layout_split_pane` into a [`TmuxLayoutCell`], consuming them from `pairs`.
+fn parse_layout_cell(pairs: &mut Pairs<Rule>) -> Result<TmuxLayoutCell> {
+    let mut next = || {
+        pairs
+            .next()
+            .ok_or_else(|| format_err!("layout cell: missing field"))
+    };
+    let width = parse_layout_u64(next()?)?;
+    let height = parse_layout_u64(next()?)?;
+    let left = parse_layout_u64(next()?)?;
+    let top = parse_layout_u64(next()?)?;
+    Ok(TmuxLayoutCell {
+        width,
+        height,
+        left,
+        top,
+    })
+}
+
+fn build_layout_node(pair: Pair<Rule>) -> Result<TmuxLayoutNode> {
+    match pair.as_rule() {
+        Rule::layout_pane => {
+            let mut inner = pair.into_inner();
+            let cell = parse_layout_cell(&mut inner)?;
+            let pane_id = parse_layout_u64(
+                inner
+                    .next()
+                    .ok_or_else(|| format_err!("layout leaf: missing pane id"))?,
+            )?;
+            Ok(TmuxLayoutNode::Leaf { cell, pane_id })
+        }
+        rule @ (Rule::layout_split_horizontal | Rule::layout_split_vertical) => {
+            let direction = if rule == Rule::layout_split_horizontal {
+                TmuxSplitDirection::Horizontal
+            } else {
+                TmuxSplitDirection::Vertical
+            };
+            let mut inner = pair.into_inner();
+            // The first inner pair is the `layout_split_pane` describing the
+            // container's geometry; the rest are its children.
+            let container = inner
+                .next()
+                .ok_or_else(|| format_err!("layout split: missing container cell"))?;
+            let cell = parse_layout_cell(&mut container.into_inner())?;
+            let mut children = Vec::new();
+            for child in inner {
+                children.push(build_layout_node(child)?);
+            }
+            if children.is_empty() {
+                bail!("layout split: no children");
+            }
+            Ok(TmuxLayoutNode::Split {
+                cell,
+                direction,
+                children,
+            })
+        }
+        other => bail!("unexpected rule in layout: {:?}", other),
     }
+}
 
-    Ok(result)
+/// Parse a tmux window layout string into a faithful n-ary [`TmuxLayoutNode`]
+/// tree. Accepts the string with or without the leading checksum.
+pub fn parse_layout_tree(layout: &str) -> Result<TmuxLayoutNode> {
+    let body = strip_layout_checksum(layout);
+    let mut pairs = parser::TmuxParser::parse(Rule::layout_window, body)?;
+    let pair = pairs
+        .next()
+        .ok_or_else(|| format_err!("empty layout: {:?}", layout))?;
+    // Ensure the whole layout was consumed (catches malformed trailing data).
+    let end = pair.as_span().end();
+    if end != body.len() {
+        bail!(
+            "trailing data in layout after offset {}: {:?}",
+            end,
+            layout
+        );
+    }
+    build_layout_node(pair)
 }
 
 pub struct Parser {
@@ -1145,32 +1172,120 @@ here
         );
     }
 
+    fn leaf(node: &TmuxLayoutNode) -> (TmuxPaneId, TmuxLayoutCell) {
+        match node {
+            TmuxLayoutNode::Leaf { pane_id, cell } => (*pane_id, *cell),
+            other => panic!("expected leaf, got {:?}", other),
+        }
+    }
+
+    fn split(node: &TmuxLayoutNode) -> (TmuxSplitDirection, &[TmuxLayoutNode], TmuxLayoutCell) {
+        match node {
+            TmuxLayoutNode::Split {
+                direction,
+                children,
+                cell,
+            } => (*direction, children.as_slice(), *cell),
+            other => panic!("expected split, got {:?}", other),
+        }
+    }
+
     #[test]
-    fn test_parse_layout() {
-        let layout_case1 = "158x40,0,0,72".to_string();
-        let layout_case2 = "158x40,0,0[158x20,0,0,69,158x19,0,21{79x19,0,21,70,78x19,80,21[78x9,80,21,71,78x9,80,31,73]}]".to_string();
-        let layout_case3 = "158x40,0,0{79x40,0,0[79x20,0,0,74,79x19,0,21{39x19,0,21,76,39x19,40,21,77}],78x40,80,0,75}".to_string();
+    fn test_parse_layout_tree_single() {
+        // A single pane (real capture: `b25d,80x24,0,0,0`).
+        let node = parse_layout_tree("80x24,0,0,0").unwrap();
+        assert_eq!(
+            node,
+            TmuxLayoutNode::Leaf {
+                cell: TmuxLayoutCell {
+                    width: 80,
+                    height: 24,
+                    left: 0,
+                    top: 0
+                },
+                pane_id: 0,
+            }
+        );
+        assert_eq!(node.pane_ids(), vec![0]);
+    }
 
-        let mut layout = parse_layout(&layout_case1).unwrap();
-        let l = layout.pop().unwrap();
-        assert!(if let WindowLayout::SinglePane(p) = l {
-            assert_eq!(p.pane_width, 158);
-            assert_eq!(p.pane_height, 40);
-            assert_eq!(p.pane_left, 0);
-            assert_eq!(p.pane_top, 0);
-            assert_eq!(p.pane_id, 72);
-            true
-        } else {
-            false
-        });
+    #[test]
+    fn test_parse_layout_tree_checksum_optional() {
+        // Parsing with and without the leading checksum yields the same tree.
+        let with = parse_layout_tree("b25d,80x24,0,0,0").unwrap();
+        let without = parse_layout_tree("80x24,0,0,0").unwrap();
+        assert_eq!(with, without);
+    }
 
-        layout = parse_layout(&layout_case2).unwrap();
-        assert!(matches!(&layout[0], WindowLayout::SplitVertical(_x)));
-        assert!(matches!(&layout[1], WindowLayout::SplitHorizontal(_x)));
-        assert!(matches!(&layout[2], WindowLayout::SplitVertical(_x)));
-        layout = parse_layout(&layout_case3).unwrap();
-        assert!(matches!(&layout[0], WindowLayout::SplitHorizontal(_x)));
-        assert!(matches!(&layout[1], WindowLayout::SplitVertical(_x)));
-        assert!(matches!(&layout[2], WindowLayout::SplitHorizontal(_x)));
+    #[test]
+    fn test_parse_layout_tree_horizontal() {
+        // Real capture of `split-window -h`.
+        let node = parse_layout_tree("80x24,0,0{40x24,0,0,0,39x24,41,0,1}").unwrap();
+        let (dir, children, cell) = split(&node);
+        assert_eq!(dir, TmuxSplitDirection::Horizontal);
+        assert_eq!(cell.width, 80);
+        assert_eq!(children.len(), 2);
+        assert_eq!(leaf(&children[0]).0, 0);
+        assert_eq!(leaf(&children[1]).0, 1);
+        assert_eq!(node.pane_ids(), vec![0, 1]);
+    }
+
+    #[test]
+    fn test_parse_layout_tree_deeply_nested() {
+        // Real capture: H{ pane0, V[ pane1, H{ pane2, pane3 } ] }.
+        let node = parse_layout_tree(
+            "1558,80x24,0,0{40x24,0,0,0,39x24,41,0[39x12,41,0,1,39x11,41,13{19x11,41,13,2,19x11,61,13,3}]}",
+        )
+        .unwrap();
+        let (dir, children, _) = split(&node);
+        assert_eq!(dir, TmuxSplitDirection::Horizontal);
+        assert_eq!(children.len(), 2);
+        assert_eq!(leaf(&children[0]), (
+            0,
+            TmuxLayoutCell { width: 40, height: 24, left: 0, top: 0 }
+        ));
+
+        let (dir1, children1, cell1) = split(&children[1]);
+        assert_eq!(dir1, TmuxSplitDirection::Vertical);
+        assert_eq!(cell1, TmuxLayoutCell { width: 39, height: 24, left: 41, top: 0 });
+        assert_eq!(children1.len(), 2);
+        assert_eq!(leaf(&children1[0]).0, 1);
+
+        let (dir2, children2, _) = split(&children1[1]);
+        assert_eq!(dir2, TmuxSplitDirection::Horizontal);
+        assert_eq!(children2.len(), 2);
+        assert_eq!(leaf(&children2[0]).0, 2);
+        assert_eq!(leaf(&children2[1]).0, 3);
+
+        // Faithful in-order pane enumeration.
+        assert_eq!(node.pane_ids(), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn test_parse_layout_tree_many_children() {
+        // Real capture of `select-layout even-horizontal`: ONE split, FOUR children.
+        let node =
+            parse_layout_tree("764c,80x24,0,0{19x24,0,0,0,19x24,20,0,1,19x24,40,0,2,20x24,60,0,3}")
+                .unwrap();
+        let (dir, children, cell) = split(&node);
+        assert_eq!(dir, TmuxSplitDirection::Horizontal);
+        assert_eq!(children.len(), 4);
+        assert_eq!(node.pane_ids(), vec![0, 1, 2, 3]);
+
+        // Divider arithmetic invariant: sum of child widths + (n-1) dividers
+        // equals the container width.
+        let total: u64 = children.iter().map(|c| c.cell().width).sum();
+        assert_eq!(total + (children.len() as u64 - 1), cell.width);
+        // And the lefts step over each child plus a 1-cell divider.
+        let mut x = cell.left;
+        for c in children {
+            assert_eq!(c.cell().left, x);
+            x += c.cell().width + 1;
+        }
+    }
+
+    #[test]
+    fn test_parse_layout_tree_rejects_trailing_garbage() {
+        assert!(parse_layout_tree("80x24,0,0,0,garbage").is_err());
     }
 }

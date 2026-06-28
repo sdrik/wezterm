@@ -1,14 +1,15 @@
 use crate::domain::{DomainId, WriterWrapper};
 use crate::localpane::LocalPane;
 use crate::pane::{alloc_pane_id, PaneId};
-use crate::tab::{SplitDirection, SplitRequest, SplitSize, Tab, TabId};
+use crate::tab::{SplitDirection, Tab};
 use crate::tmux::{AttachState, TmuxDomain, TmuxDomainState, TmuxRemotePane, TmuxTab};
+use crate::tmux_layout::{build_pane_node, LayoutContext};
 use crate::tmux_pty::{TmuxChild, TmuxPty};
 use crate::{Mux, MuxNotification, Pane};
 use anyhow::{anyhow, Context};
 use parking_lot::{Condvar, Mutex};
 use portable_pty::{MasterPty, PtySize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Write};
 use std::io::Write as _;
 use std::sync::Arc;
@@ -45,8 +46,12 @@ struct WindowItem {
     window_height: u64,
     window_active: bool,
     window_name: String,
-    layout: Vec<WindowLayout>,
-    layout_csum: String,
+    /// Raw tmux layout string (including the leading checksum).
+    window_layout: String,
+    /// Raw `#{window_visible_layout}` (single pane when zoomed).
+    window_visible_layout: String,
+    /// Raw `#{window_raw_flags}` (contains `Z` when the window is zoomed).
+    window_raw_flags: String,
     history_limit: isize,
 }
 
@@ -64,81 +69,6 @@ impl TmuxDomainState {
     pub fn check_window_attached(&self, window_id: TmuxWindowId) -> bool {
         let gui_tabs = self.gui_tabs.lock();
         return gui_tabs.get(&window_id).is_some();
-    }
-
-    /// after we create a tab for a remote pane, save its ID into the
-    /// TmuxPane-TmuxPane tree, so we can ref it later.
-    fn add_attached_pane(
-        &self,
-        window_id: TmuxWindowId,
-        pane_id: TmuxPaneId,
-    ) -> anyhow::Result<()> {
-        let mut gui_tabs = self.gui_tabs.lock();
-
-        let panes = match gui_tabs.get_mut(&window_id) {
-            Some(tab) => &mut tab.panes,
-            None => anyhow::bail!("The window {window_id} is not attached"),
-        };
-
-        match panes.get(&pane_id) {
-            Some(_) => {
-                anyhow::bail!("Tmux pane already attached");
-            }
-            None => {
-                panes.insert(pane_id);
-                return Ok(());
-            }
-        }
-    }
-
-    fn add_attached_window(&self, target: &WindowItem, tab_id: &TabId) -> anyhow::Result<()> {
-        let mut gui_tabs = self.gui_tabs.lock();
-        if !gui_tabs.contains_key(&target.window_id) {
-            gui_tabs.insert(
-                target.window_id,
-                TmuxTab {
-                    tab_id: *tab_id,
-                    tmux_window_id: target.window_id,
-                    layout_csum: target.layout_csum.clone(),
-                    panes: HashSet::new(),
-                },
-            );
-        }
-
-        Ok(())
-    }
-
-    fn remove_detached_pane(
-        &self,
-        window_id: TmuxWindowId,
-        new_set: &HashSet<TmuxPaneId>,
-    ) -> anyhow::Result<()> {
-        let mut gui_tabs = self.gui_tabs.lock();
-
-        let (tab_id, panes) = match gui_tabs.get_mut(&window_id) {
-            Some(tab) => (tab.tab_id, &mut tab.panes),
-            None => anyhow::bail!("The window {window_id} is not attached"),
-        };
-
-        let to_remove: Vec<_> = panes.difference(new_set).cloned().collect();
-
-        let mux = Mux::get();
-        for p in to_remove {
-            let pane_map = self.remote_panes.lock();
-            let Some(pane) = pane_map.get(&p) else {
-                continue;
-            };
-            let local_pane_id = pane.lock().local_pane_id;
-            mux.remove_pane(local_pane_id);
-            panes.remove(&p);
-        }
-
-        if panes.is_empty() {
-            mux.remove_tab(tab_id);
-            gui_tabs.remove(&window_id);
-        }
-
-        Ok(())
     }
 
     pub fn remove_detached_window(&self, window_id: TmuxWindowId) -> anyhow::Result<()> {
@@ -230,60 +160,286 @@ impl TmuxDomainState {
         )))
     }
 
-    pub fn split_pane(
+    /// Apply a parsed tmux window layout to the corresponding local tab,
+    /// rebuilding its pane tree atomically (flicker-free, idempotent). New tmux
+    /// panes are created and existing ones reused; panes that disappeared are
+    /// reaped by the deferred global prune. The local tab for `window_id` must
+    /// already exist.
+    fn apply_layout(
         &self,
-        tab_id: TabId,
-        pane_id: PaneId,
-        remote_id: TmuxPaneId,
-        split_request: SplitRequest,
-    ) -> anyhow::Result<Arc<dyn Pane>> {
+        window_id: TmuxWindowId,
+        layout: &TmuxLayoutNode,
+        active_pane: Option<TmuxPaneId>,
+        zoomed_pane: Option<TmuxPaneId>,
+        capture_new: bool,
+    ) -> anyhow::Result<()> {
         let mux = Mux::get();
-        let tab = match mux.get_tab(tab_id) {
-            Some(t) => t,
-            None => anyhow::bail!("Invalid tab id {}", tab_id),
+
+        let (tab_id, history_limit) = {
+            let gui_tabs = self.gui_tabs.lock();
+            let Some(t) = gui_tabs.get(&window_id) else {
+                anyhow::bail!("apply_layout: tmux window @{window_id} has no local tab");
+            };
+            (t.tab_id, t.history_limit)
         };
 
-        let pane_index = match tab
-            .iter_panes_ignoring_zoom()
-            .iter()
-            .find(|p| p.pane.pane_id() == pane_id)
+        let Some(tab) = mux.get_tab(tab_id) else {
+            anyhow::bail!("apply_layout: local tab {tab_id} is gone");
+        };
+
+        // We always rebuild rather than skipping on an unchanged checksum: the
+        // rebuild reuses existing pane objects (so it is flicker-free and
+        // effectively idempotent), and zoom toggles arrive as a %layout-change
+        // whose full layout — and thus checksum — is unchanged, so a checksum
+        // skip would miss them.
+
+        // 1) Reconcile the pane set: create local panes for tmux panes we have
+        // not seen yet (split results, freshly attached windows); reuse the rest.
+        let leaves = layout.leaves();
+        let mut newly_created: Vec<Arc<dyn Pane>> = Vec::new();
+        for (tmux_pid, cell) in &leaves {
+            let already_exists = self.remote_panes.lock().contains_key(tmux_pid);
+            if already_exists {
+                continue;
+            }
+            let item = PaneItem {
+                session_id: 0,
+                window_id,
+                pane_id: *tmux_pid,
+                _pane_index: 0,
+                cursor_x: 0,
+                cursor_y: 0,
+                pane_width: cell.width,
+                pane_height: cell.height,
+                pane_left: cell.left,
+                pane_top: cell.top,
+                pane_active: false,
+            };
+            let local_pane = self
+                .create_pane(&item)
+                .context("failed to create tmux pane")?;
+            let _ = mux.add_pane(&local_pane);
+
+            // Flush any output that arrived before the pane existed.
+            if let Some(text) = self.backlog.lock().remove(tmux_pid) {
+                if let Some(ref_pane) = self.remote_panes.lock().get(tmux_pid) {
+                    let _ = ref_pane.lock().output_write.write_all(&text);
+                }
+            }
+
+            if capture_new {
+                self.cmd_queue.lock().push_back(Box::new(CapturePane {
+                    pane_id: *tmux_pid,
+                    history_limit,
+                }));
+            }
+            newly_created.push(local_pane);
+        }
+
+        // 2) Collect (tmux -> local) ids and live handles; bail before touching
+        // the tab if anything is unexpectedly missing.
+        let mut local_pane_ids: HashMap<TmuxPaneId, PaneId> = HashMap::new();
+        let mut panes_by_local: HashMap<PaneId, Arc<dyn Pane>> = HashMap::new();
+        for (tmux_pid, _) in &leaves {
+            let local_id = match self.remote_panes.lock().get(tmux_pid) {
+                Some(p) => p.lock().local_pane_id,
+                None => anyhow::bail!("apply_layout: pane %{tmux_pid} missing after reconcile"),
+            };
+            let pane = mux
+                .get_pane(local_id)
+                .ok_or_else(|| anyhow!("apply_layout: local pane {local_id} missing"))?;
+            local_pane_ids.insert(*tmux_pid, local_id);
+            panes_by_local.insert(local_id, pane);
+        }
+
+        // 3) Build the wezterm PaneNode tree from the tmux layout.
+        let Some(gui_window_id) = self.gui_window.lock().as_ref().map(|w| w.window_id) else {
+            anyhow::bail!("apply_layout: no gui window");
+        };
+        let workspace = mux
+            .get_window(gui_window_id)
+            .map(|w| w.get_workspace().to_string())
+            .unwrap_or_default();
+        let (cell_pixel_width, cell_pixel_height, dpi) = self.cell_pixel_dimensions();
+
+        let root = {
+            let ctx = LayoutContext {
+                window_id: gui_window_id,
+                tab_id,
+                workspace,
+                dpi,
+                cell_pixel_width,
+                cell_pixel_height,
+                active_pane,
+                zoomed_pane,
+                local_pane_ids: &local_pane_ids,
+            };
+            build_pane_node(layout, &ctx)
+        };
+
+        let root_cell = layout.cell();
+        let size = TerminalSize {
+            rows: root_cell.height as usize,
+            cols: root_cell.width as usize,
+            pixel_width: root_cell.width as usize * cell_pixel_width,
+            pixel_height: root_cell.height as usize * cell_pixel_height,
+            dpi,
+        };
+
+        // 4) Atomically swap in the rebuilt tree, reusing existing pane objects.
+        tab.sync_with_pane_tree(size, root, |entry| {
+            panes_by_local
+                .get(&entry.pane_id)
+                .cloned()
+                .or_else(|| mux.get_pane(entry.pane_id))
+                .expect("apply_layout: pane materialized during reconcile")
+        });
+
+        // 5) Record the new pane set (used by the global prune).
         {
-            Some(p) => p.index,
-            None => anyhow::bail!("invalid pane id {}", pane_id),
+            let mut gui_tabs = self.gui_tabs.lock();
+            if let Some(t) = gui_tabs.get_mut(&window_id) {
+                t.panes = leaves.iter().map(|(pid, _)| *pid).collect();
+            }
+        }
+
+        // 6) Resolve any user-initiated split awaiting a freshly created pane.
+        if !capture_new {
+            for pane in &newly_created {
+                let mut pending = self.pending_splits.lock();
+                match pending.pop_front() {
+                    Some(mut promise) => {
+                        promise.ok(pane.pane_id());
+                    }
+                    None => break,
+                }
+            }
+        }
+
+        // 7) Reap panes that no longer appear in any window, once quiescent.
+        self.schedule_prune();
+
+        Ok(())
+    }
+
+    /// Cell pixel geometry + dpi from the controlling tmux pane, used to fill
+    /// `TerminalSize` pixel fields. Falls back to zeros (tolerated by the layout
+    /// math) if the controlling pane is unavailable.
+    fn cell_pixel_dimensions(&self) -> (usize, usize, u32) {
+        match Mux::get().get_pane(self.pane_id) {
+            Some(p) => {
+                let d = p.get_dimensions();
+                let cpw = if d.cols > 0 { d.pixel_width / d.cols } else { 0 };
+                let cph = if d.viewport_rows > 0 {
+                    d.pixel_height / d.viewport_rows
+                } else {
+                    0
+                };
+                (cpw, cph, d.dpi)
+            }
+            None => (0, 0, 0),
+        }
+    }
+
+    /// Handle a `%layout-change`: parse the layout, derive zoom state, and
+    /// rebuild the local tab.
+    pub fn handle_layout_change(
+        &self,
+        window_id: TmuxWindowId,
+        layout: &str,
+        visible_layout: Option<&str>,
+        raw_flags: Option<&str>,
+    ) -> anyhow::Result<()> {
+        if !self.check_window_attached(window_id) {
+            // tmux does not emit %layout-change for a window before it is linked
+            // (window-add + list-windows build its tab); ignore until then.
+            log::debug!("tmux layout-change for unattached window @{window_id}; ignoring");
+            return Ok(());
+        }
+
+        let tree =
+            parse_layout_tree(layout).with_context(|| format!("parsing tmux layout {layout:?}"))?;
+        let active = self.gui_tabs.lock().get(&window_id).and_then(|t| t.active_pane);
+
+        // The full layout always lists every pane; zoom is signalled by the `Z`
+        // flag and the zoomed pane is the sole leaf of the visible layout
+        // (equivalently, the active pane).
+        let zoomed = raw_flags.map_or(false, |f| f.contains('Z'));
+        let zoomed_pane = if zoomed {
+            visible_layout
+                .and_then(|v| parse_layout_tree(v).ok())
+                .and_then(|v| match v {
+                    TmuxLayoutNode::Leaf { pane_id, .. } => Some(pane_id),
+                    _ => active,
+                })
+                .or(active)
+        } else {
+            None
         };
 
-        let split_size = match tab.compute_split_size(pane_index, split_request) {
-            Some(s) => s,
-            None => anyhow::bail!("invalid pane index {}", pane_index),
+        self.apply_layout(window_id, &tree, active, zoomed_pane, false)
+    }
+
+    /// Track the active pane for a window (from `%window-pane-changed`) and, if
+    /// the corresponding local pane already exists, focus it.
+    pub fn set_active_tmux_pane(&self, window_id: TmuxWindowId, pane_id: TmuxPaneId) {
+        let tab_id = {
+            let mut gui_tabs = self.gui_tabs.lock();
+            let Some(t) = gui_tabs.get_mut(&window_id) else {
+                return;
+            };
+            t.active_pane = Some(pane_id);
+            t.tab_id
         };
 
-        let window_id = match self.gui_tabs.lock().iter().find(|t| t.1.tab_id == tab_id) {
-            Some((_, tab)) => tab.tmux_window_id,
-            None => anyhow::bail!("No tab {}", tab_id),
+        let mux = Mux::get();
+        let local_id = self
+            .remote_panes
+            .lock()
+            .get(&pane_id)
+            .map(|p| p.lock().local_pane_id);
+        if let (Some(local_id), Some(tab)) = (local_id, mux.get_tab(tab_id)) {
+            if let Some(local_pane) = mux.get_pane(local_id) {
+                tab.set_active_pane(&local_pane);
+            }
+        }
+    }
+
+    /// Destroy local panes whose tmux id no longer appears in any window's last
+    /// applied layout. Runs at a quiescent point so that a pane moved between
+    /// windows (its source removal observed before the destination insertion)
+    /// keeps its identity instead of being destroyed and recreated.
+    pub fn prune_dead_panes(&self) {
+        let mux = Mux::get();
+        let live: HashSet<TmuxPaneId> = self
+            .gui_tabs
+            .lock()
+            .values()
+            .flat_map(|t| t.panes.iter().copied())
+            .collect();
+
+        let dead: Vec<(TmuxPaneId, PaneId)> = {
+            let pane_map = self.remote_panes.lock();
+            pane_map
+                .iter()
+                .filter(|(pid, _)| !live.contains(*pid))
+                .map(|(pid, p)| (*pid, p.lock().local_pane_id))
+                .collect()
         };
 
-        let p = PaneItem {
-            session_id: 0,
-            window_id: window_id,
-            pane_id: remote_id,
-            _pane_index: 0,
-            cursor_x: 0,
-            cursor_y: 0,
-            pane_width: split_size.second.cols as u64,
-            pane_height: split_size.second.rows as u64,
-            pane_left: 0,
-            pane_top: 0,
-            pane_active: false,
-        };
-
-        let pane = self.create_pane(&p).context("failed to create pane")?;
-        tab.split_and_insert(pane_index, split_request, Arc::clone(&pane))?;
-
-        self.add_attached_pane(window_id, remote_id)?;
-
-        let _ = mux.add_pane(&pane);
-
-        return Ok(pane);
+        for (tmux_pid, local_id) in dead {
+            // Release the fake child so the pane's reader can exit.
+            if let Some(ref_pane) = self.remote_panes.lock().get(&tmux_pid) {
+                let p = ref_pane.lock();
+                let (lock, condvar) = &*p.active_lock;
+                *lock.lock() = true;
+                condvar.notify_all();
+            }
+            self.remote_panes.lock().remove(&tmux_pid);
+            self.backlog.lock().remove(&tmux_pid);
+            mux.remove_pane(local_id);
+            log::info!("tmux pruned dead pane %{tmux_pid} (local {local_id})");
+        }
     }
 
     fn sync_pane_state(&self, panes: &[PaneItem]) -> anyhow::Result<()> {
@@ -333,13 +489,16 @@ impl TmuxDomainState {
                     }
                 }
                 if pane.pane_active {
-                    let gui_tabs = self.gui_tabs.lock();
-
-                    let Some(local_tab) = gui_tabs.get(&pane.window_id) else {
-                        anyhow::bail!("invalid tmux window id {}", pane.window_id);
+                    let tab_id = {
+                        let mut gui_tabs = self.gui_tabs.lock();
+                        let Some(local_tab) = gui_tabs.get_mut(&pane.window_id) else {
+                            anyhow::bail!("invalid tmux window id {}", pane.window_id);
+                        };
+                        local_tab.active_pane = Some(pane.pane_id);
+                        local_tab.tab_id
                     };
 
-                    match mux.get_tab(local_tab.tab_id) {
+                    match mux.get_tab(tab_id) {
                         Some(tab) => {
                             tab.set_active_pane(&local_pane);
                             mux.notify(MuxNotification::PaneFocused(local_pane.pane_id()));
@@ -360,15 +519,7 @@ impl TmuxDomainState {
             return Ok(());
         };
         let mux = Mux::get();
-
         self.create_gui_window();
-        let mut gui_window = self.gui_window.lock();
-        let gui_window_id = match gui_window.as_mut() {
-            Some(x) => x,
-            None => {
-                anyhow::bail!("No tmux gui created");
-            }
-        };
 
         for window in windows.iter() {
             if window.session_id != current_session {
@@ -383,159 +534,94 @@ impl TmuxDomainState {
                 dpi: 0,
             };
 
-            let tab = Arc::new(Tab::new(&size));
-            tab.set_title(&format!("{}", &window.window_name));
-            mux.add_tab_no_panes(&tab);
-
-            let _ = self.add_attached_window(window, &tab.tab_id())?;
-
-            let mut split_stack;
-            let mut split_direction;
-
-            let mut split_pane_index = 1;
-            for l in &window.layout {
-                match l {
-                    WindowLayout::SinglePane(x) => {
-                        let p = PaneItem {
-                            session_id: window.session_id,
-                            window_id: window.window_id,
-                            _pane_index: 0,
-                            cursor_x: 0,
-                            cursor_y: 0,
-                            pane_active: false,
-                            pane_id: x.pane_id,
-                            pane_width: x.pane_width,
-                            pane_height: x.pane_height,
-                            pane_left: x.pane_left,
-                            pane_top: x.pane_top,
-                        };
-                        let local_pane = self.create_pane(&p).context("failed to create pane")?;
-                        tab.assign_pane(&local_pane);
-                        self.add_attached_pane(p.window_id, p.pane_id)?;
-                        let _ = mux.add_pane(&local_pane);
-                        break;
-                    }
-
-                    WindowLayout::SplitHorizontal(x) => {
-                        split_direction = SplitDirection::Horizontal;
-                        split_stack = x;
-                    }
-
-                    WindowLayout::SplitVertical(x) => {
-                        split_direction = SplitDirection::Vertical;
-                        split_stack = x;
-                    }
-                }
-
-                for x in split_stack {
-                    let p = PaneItem {
-                        session_id: window.session_id,
-                        window_id: window.window_id,
-                        _pane_index: 0,
-                        cursor_x: 0,
-                        cursor_y: 0,
-                        pane_active: false,
-                        pane_id: x.pane_id,
-                        pane_width: x.pane_width,
-                        pane_height: x.pane_height,
-                        pane_left: x.pane_left,
-                        pane_top: x.pane_top,
-                    };
-                    let local_pane;
-                    if !self.check_pane_attached(p.window_id, p.pane_id) {
-                        local_pane = self.create_pane(&p).context("failed to create pane")?;
-                        self.add_attached_pane(p.window_id, p.pane_id)?;
-                        let _ = mux.add_pane(&local_pane);
-                        if let None = tab.get_active_pane() {
-                            tab.assign_pane(&local_pane);
-                            split_pane_index = tab.get_active_idx();
-                            continue;
-                        }
-
-                        split_pane_index = tab.split_and_insert(
-                            split_pane_index,
-                            SplitRequest {
-                                direction: split_direction,
-                                target_is_second: false,
-                                top_level: false,
-                                size: SplitSize::Cells(
-                                    if split_direction == SplitDirection::Horizontal {
-                                        p.pane_width as usize
-                                    } else {
-                                        p.pane_height as usize
-                                    },
-                                ),
-                            },
-                            local_pane.clone(),
-                        )? + 1;
-                    } else {
-                        let pane_map = self.remote_panes.lock();
-                        let local_pane_id = match pane_map.get(&p.pane_id) {
-                            Some(x) => x.lock().local_pane_id,
-                            None => anyhow::bail!("cannot find the local pane for {}", p.pane_id),
-                        };
-
-                        split_pane_index = match tab
-                            .iter_panes_ignoring_zoom()
-                            .iter()
-                            .find(|x| x.pane.pane_id() == local_pane_id)
-                        {
-                            Some(x) => x.index,
-                            None => {
-                                log::info!("invalid pane id {local_pane_id}");
-                                continue;
-                            }
-                        };
-                        continue;
-                    }
-                }
-            }
-
-            mux.add_tab_to_window(&tab, **gui_window_id)?;
-            gui_window_id.notify();
-
-            let gui_tabs = self.gui_tabs.lock();
-            let local_tab = match gui_tabs.get(&window.window_id) {
-                Some(x) => x,
-                None => {
-                    log::info!(
-                        "cannot find the local tab for tmux window {}",
-                        window.window_id
+            let tree = match parse_layout_tree(&window.window_layout) {
+                Ok(t) => t,
+                Err(err) => {
+                    log::error!(
+                        "invalid window layout {:?}: {:#}",
+                        window.window_layout,
+                        err
                     );
                     continue;
                 }
             };
 
-            // For new window, we wait for nature ouput instead of capturing
-            if !new_window {
-                for p in local_tab.panes.iter() {
-                    self.cmd_queue.lock().push_back(Box::new(CapturePane {
-                        pane_id: *p,
+            // Create the local tab if this window is new to us.
+            let is_new_tab = !self.check_window_attached(window.window_id);
+            if is_new_tab {
+                let tab = Arc::new(Tab::new(&size));
+                tab.set_title(&window.window_name);
+                mux.add_tab_no_panes(&tab);
+                self.gui_tabs.lock().insert(
+                    window.window_id,
+                    TmuxTab {
+                        tab_id: tab.tab_id(),
+                        tmux_window_id: window.window_id,
+                        panes: HashSet::new(),
+                        active_pane: None,
                         history_limit: window.history_limit,
-                    }));
+                    },
+                );
+            } else {
+                let tab_id = self.gui_tabs.lock().get(&window.window_id).map(|t| t.tab_id);
+                if let Some(tab) = tab_id.and_then(|id| mux.get_tab(id)) {
+                    tab.set_title(&window.window_name);
+                }
+                if let Some(t) = self.gui_tabs.lock().get_mut(&window.window_id) {
+                    t.history_limit = window.history_limit;
                 }
             }
 
-            // To keep the active window last one to make it active after set the focus pane
+            // Zoom state from window flags; the zoomed pane is the sole leaf of
+            // the visible layout.
+            let zoomed_pane = if window.window_raw_flags.contains('Z') {
+                parse_layout_tree(&window.window_visible_layout)
+                    .ok()
+                    .and_then(|v| match v {
+                        TmuxLayoutNode::Leaf { pane_id, .. } => Some(pane_id),
+                        _ => None,
+                    })
+            } else {
+                None
+            };
+
+            let active = self
+                .gui_tabs
+                .lock()
+                .get(&window.window_id)
+                .and_then(|t| t.active_pane);
+
+            // Capture existing content only for the initial attach enumeration;
+            // brand-new windows get their content via the live %output stream.
+            let capture = !new_window;
+            self.apply_layout(window.window_id, &tree, active, zoomed_pane, capture)?;
+
+            // Link the (now populated) tab into the gui window.
+            if is_new_tab {
+                let tab_id = self.gui_tabs.lock().get(&window.window_id).map(|t| t.tab_id);
+                if let Some(tab) = tab_id.and_then(|id| mux.get_tab(id)) {
+                    let mut gui_window = self.gui_window.lock();
+                    if let Some(gui_window_id) = gui_window.as_mut() {
+                        mux.add_tab_to_window(&tab, **gui_window_id)?;
+                        gui_window_id.notify();
+                    }
+                }
+            }
+
+            // Backfill cursor + active pane via list-panes (the layout string
+            // carries neither). Keep the active window last so focus settles
+            // there.
             if !window.window_active {
                 self.cmd_queue.lock().push_back(Box::new(ListAllPanes {
                     window_id: window.window_id,
-                    prune: false,
-                    layout_csum: window.layout_csum.clone(),
                 }));
             }
         }
 
-        // To keep the active window last one to make it active after set the focus pane
-        match windows.iter().find(|w| w.window_active) {
-            Some(window) => {
-                self.cmd_queue.lock().push_back(Box::new(ListAllPanes {
-                    window_id: window.window_id,
-                    prune: false,
-                    layout_csum: window.layout_csum.clone(),
-                }));
-            }
-            None => {}
+        if let Some(window) = windows.iter().find(|w| w.window_active) {
+            self.cmd_queue.lock().push_back(Box::new(ListAllPanes {
+                window_id: window.window_id,
+            }));
         }
 
         if *self.attach_state.lock() == AttachState::Init {
@@ -631,39 +717,16 @@ fn parse_sigil_number(text: &str) -> anyhow::Result<u64> {
     Ok(num)
 }
 
+/// list-panes for a single window, used purely to backfill cursor positions and
+/// the active pane (which the layout string does not carry). Structure comes
+/// from `%layout-change` / `apply_layout`.
 #[derive(Debug)]
 pub(crate) struct ListAllPanes {
     pub window_id: TmuxWindowId,
-    pub prune: bool,
-    pub layout_csum: String,
 }
 
 impl TmuxCommand for ListAllPanes {
-    fn get_command(&self, domain_id: DomainId) -> String {
-        let mux = Mux::get();
-        let domain = match mux.get_domain(domain_id) {
-            Some(d) => d,
-            None => return "".to_string(),
-        };
-        let tmux_domain = match domain.downcast_ref::<TmuxDomain>() {
-            Some(t) => t,
-            None => return "".to_string(),
-        };
-
-        let mut gui_tabs = tmux_domain.inner.gui_tabs.lock();
-
-        let Some(local_tab) = gui_tabs.get_mut(&self.window_id) else {
-            return "".to_string();
-        };
-
-        if local_tab.layout_csum.eq(&self.layout_csum) {
-            if self.prune {
-                return "".to_string();
-            }
-        } else {
-            local_tab.layout_csum = self.layout_csum.clone();
-        }
-
+    fn get_command(&self, _domain_id: DomainId) -> String {
         format!(
             "list-panes -F '#{{session_id}} #{{window_id}} #{{pane_id}} \
             #{{pane_index}} #{{cursor_x}} #{{cursor_y}} #{{pane_width}} #{{pane_height}} \
@@ -679,7 +742,6 @@ impl TmuxCommand for ListAllPanes {
             anyhow::bail!("{error}");
         }
         let mut items = vec![];
-        let mut pane_set = HashSet::new();
         for line in result.output.split('\n') {
             if line.is_empty() {
                 continue;
@@ -728,8 +790,6 @@ impl TmuxCommand for ListAllPanes {
 
             let pane_active = pane_active == 1;
 
-            pane_set.insert(pane_id);
-
             items.push(PaneItem {
                 session_id,
                 window_id,
@@ -749,13 +809,7 @@ impl TmuxCommand for ListAllPanes {
         let mux = Mux::get();
         if let Some(domain) = mux.get_domain(domain_id) {
             if let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() {
-                if !self.prune {
-                    return tmux_domain.inner.sync_pane_state(&items);
-                } else {
-                    return tmux_domain
-                        .inner
-                        .remove_detached_pane(self.window_id, &pane_set);
-                }
+                return tmux_domain.inner.sync_pane_state(&items);
             }
         }
         anyhow::bail!("Tmux domain lost");
@@ -777,6 +831,8 @@ impl TmuxCommand for ListAllWindows {
                 #{{window_active}} \
                 #{{window_name}} \
                 #{{window_layout}} \
+                #{{window_visible_layout}} \
+                #{{window_raw_flags}} \
                 #{{history_limit}}' -t ${}\n",
             self.session_id
         )
@@ -820,6 +876,16 @@ impl TmuxCommand for ListAllWindows {
                 .next()
                 .ok_or_else(|| anyhow!("missing window_layout"))?;
 
+            let window_visible_layout = fields
+                .next()
+                .ok_or_else(|| anyhow!("missing window_visible_layout"))?;
+
+            // window_raw_flags may legitimately be empty (no flags); split(' ')
+            // still yields an empty token between the surrounding spaces.
+            let window_raw_flags = fields
+                .next()
+                .ok_or_else(|| anyhow!("missing window_raw_flags"))?;
+
             let history_limit = fields
                 .next()
                 .ok_or_else(|| anyhow!("missing history_limit"))?
@@ -833,15 +899,6 @@ impl TmuxCommand for ListAllWindows {
                 }
             }
 
-            let layout_csum = window_layout
-                .get(0..4)
-                .ok_or_else(|| anyhow!("missing window_layout"))?;
-            let window_layout = window_layout
-                .get(5..)
-                .ok_or_else(|| anyhow!("missing window_layout"))?;
-
-            let layout = parse_layout(window_layout)?;
-
             items.push(WindowItem {
                 session_id,
                 window_id,
@@ -849,8 +906,9 @@ impl TmuxCommand for ListAllWindows {
                 window_height,
                 window_active,
                 window_name: window_name.to_string(),
-                layout,
-                layout_csum: layout_csum.to_string(),
+                window_layout: window_layout.to_string(),
+                window_visible_layout: window_visible_layout.to_string(),
+                window_raw_flags: window_raw_flags.to_string(),
                 history_limit,
             });
         }

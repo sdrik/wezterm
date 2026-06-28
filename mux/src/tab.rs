@@ -2207,6 +2207,76 @@ mod test {
     use wezterm_term::color::ColorPalette;
     use wezterm_term::{KeyCode, KeyModifiers, Line, MouseEvent, StableRowIndex};
 
+    /// End-to-end check that a tmux layout, converted to a `PaneNode` and
+    /// applied via `sync_with_pane_tree` (which also calls `resize`), yields
+    /// pane rectangles identical to the ones tmux describes.
+    #[test]
+    fn tmux_layout_matches_tmux_rectangles() {
+        use crate::tmux_layout::{build_pane_node, LayoutContext};
+        use std::collections::HashMap;
+        use termwiz::tmux_cc::{parse_layout_tree, TmuxPaneId};
+
+        for layout_str in [
+            "80x24,0,0,0",
+            "80x24,0,0{40x24,0,0,0,39x24,41,0,1}",
+            "80x24,0,0[80x12,0,0,1,80x11,0,13,2]",
+            "80x24,0,0{19x24,0,0,0,19x24,20,0,1,19x24,40,0,2,20x24,60,0,3}",
+            "80x24,0,0{40x24,0,0,0,39x24,41,0[39x12,41,0,1,39x11,41,13{19x11,41,13,2,19x11,61,13,3}]}",
+        ] {
+            let layout = parse_layout_tree(layout_str).unwrap();
+            let ids: HashMap<TmuxPaneId, PaneId> = layout
+                .pane_ids()
+                .into_iter()
+                .map(|id| (id, id as PaneId))
+                .collect();
+            let ctx = LayoutContext {
+                window_id: 0,
+                tab_id: 0,
+                workspace: "w".to_string(),
+                dpi: 96,
+                cell_pixel_width: 8,
+                cell_pixel_height: 16,
+                active_pane: None,
+                zoomed_pane: None,
+                local_pane_ids: &ids,
+            };
+            let node = build_pane_node(&layout, &ctx);
+
+            let root = layout.cell();
+            let size = TerminalSize {
+                rows: root.height as usize,
+                cols: root.width as usize,
+                pixel_width: root.width as usize * 8,
+                pixel_height: root.height as usize * 16,
+                dpi: 96,
+            };
+
+            let tab = Tab::new(&size);
+            tab.sync_with_pane_tree(size, node, |entry| FakePane::new(entry.pane_id, entry.size));
+
+            let mut got: HashMap<PaneId, (usize, usize, usize, usize)> = HashMap::new();
+            for pos in tab.iter_panes_ignoring_zoom() {
+                got.insert(
+                    pos.pane.pane_id(),
+                    (pos.left, pos.top, pos.width, pos.height),
+                );
+            }
+            for (pid, cell) in layout.leaves() {
+                let expect = (
+                    cell.left as usize,
+                    cell.top as usize,
+                    cell.width as usize,
+                    cell.height as usize,
+                );
+                assert_eq!(
+                    got.get(&(pid as PaneId)),
+                    Some(&expect),
+                    "pane %{pid} rectangle mismatch for layout {layout_str}"
+                );
+            }
+        }
+    }
+
     struct FakePane {
         id: PaneId,
         size: Mutex<TerminalSize>,

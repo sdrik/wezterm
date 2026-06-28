@@ -1736,6 +1736,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &[],
             icon: Some("md_keyboard_variant"),
         },
+        TmuxSendCommand(_) => return None,
         Nop => CommandDef {
             brief: "Does nothing".into(),
             doc: "Has no effect".into(),

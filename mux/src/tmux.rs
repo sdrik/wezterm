@@ -2,7 +2,9 @@ use crate::activity::Activity;
 use crate::domain::{alloc_domain_id, Domain, DomainId, DomainState, SplitSource};
 use crate::pane::{Pane, PaneId};
 use crate::tab::{SplitRequest, Tab, TabId};
-use crate::tmux_commands::{ListAllWindows, ListCommands, NewWindow, SplitPane, TmuxCommand};
+use crate::tmux_commands::{
+    ListAllWindows, ListCommands, NewWindow, RawCommand, SplitPane, TmuxCommand
+};
 use crate::window::WindowId;
 use crate::{Mux, MuxWindowBuilder};
 use async_trait::async_trait;
@@ -435,6 +437,17 @@ impl TmuxDomain {
 
     fn send_next_command(&self) {
         self.inner.send_next_command();
+    }
+
+    /// Inject an arbitrary tmux command line into the -CC control stream.
+    /// Routed through the existing `cmd_queue` so the `%begin/%end` guard
+    /// emitted by tmux is consumed by the normal response machinery.
+    pub fn send_raw_command(&self, command: String) {
+        self.inner
+            .cmd_queue
+            .lock()
+            .push_back(Box::new(RawCommand { command }));
+        TmuxDomainState::schedule_send_next_command(self.inner.domain_id);
     }
 }
 

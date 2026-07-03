@@ -9,6 +9,7 @@ word = { (ASCII_ALPHANUMERIC | "/")+ }
 client_name = { word }
 pane_id = { "%" ~ number }
 session_id = { "$" ~ number }
+subscription_name = { (!" " ~ ANY)+ }
 window_id = { "@" ~ number }
 window_layout = { (ASCII_HEX_DIGIT | "x" | "[" | "]" | "{" | "}" | ",")+ }
 
@@ -35,7 +36,12 @@ session_changed = { "%session-changed " ~ session_id ~ " " ~ any_text }
 session_renamed = { "%session-renamed " ~ any_text }
 session_window_changed = { "%session-window-changed " ~ session_id ~ " " ~ window_id }
 sessions_changed = { "%sessions-changed" }
-subscription_changed = { "%subscription-changed " ~ any_text }
+subscription_changed = { "%subscription-changed " ~ subscription_name
+                       ~ " " ~ session_id
+                       ~ " " ~ (window_id | "-")
+                       ~ " " ~ (number | "-")
+                       ~ " " ~ (pane_id | "-")
+                       ~ " : " ~ any_text }
 unlinked_window_add = { "%unlinked-window-add " ~ window_id }
 unlinked_window_close = { "%unlinked-window-close " ~ window_id }
 unlinked_window_renamed = { "%unlinked-window-renamed " ~ window_id }

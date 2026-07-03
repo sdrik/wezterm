@@ -103,7 +103,23 @@ pub enum Event {
         session: TmuxSessionId,
         window: TmuxWindowId,
     },
-    SubscriptionChanged,
+    /// A `%subscription-changed` notification carrying the latest value of a
+    /// format string we subscribed to via `refresh-client -B`.
+    ///
+    /// The wire format is:
+    /// `%subscription-changed <name> <session-id> <window-id|-> <window-index|-> <pane-id|-> : <value>`
+    /// where the id/index fields are `-` when not applicable to the
+    /// subscription's target (e.g. a session-scoped subscription has no
+    /// window/pane), and `value` (free-form, may contain `:` or ` : `) is
+    /// everything after the first ` : `.
+    SubscriptionChanged {
+        name: String,
+        session: Option<TmuxSessionId>,
+        window: Option<TmuxWindowId>,
+        window_index: Option<u64>,
+        pane: Option<TmuxPaneId>,
+        value: String,
+    },
     UnlinkedWindowAdd {
         window: TmuxWindowId,
     },
@@ -424,7 +440,33 @@ fn parse_line(line: &[u8]) -> Result<Event> {
             Ok(Event::SessionWindowChanged { session, window })
         }
         Rule::sessions_changed => Ok(Event::SessionsChanged),
-        Rule::subscription_changed => Ok(Event::SubscriptionChanged),
+        Rule::subscription_changed => {
+            let mut name = String::new();
+            let (mut session, mut window, mut window_index, mut pane) = (None, None, None, None);
+            let mut value = String::new();
+            for inner in pair.into_inner() {
+                match inner.as_rule() {
+                    Rule::subscription_name => name = inner.as_str().to_owned(),
+                    Rule::session_id => session = Some(parse_session_id(inner)?),
+                    Rule::window_id => window = Some(parse_window_id(inner)?),
+                    // The only bare `number` child of subscription_changed is the
+                    // window index (the numbers inside session/window/pane ids are
+                    // nested in their own pairs, not direct children).
+                    Rule::number => window_index = inner.as_str().parse().ok(),
+                    Rule::pane_id => pane = Some(parse_pane_id(inner)?),
+                    Rule::any_text => value = inner.as_str().to_owned(),
+                    _ => {}
+                }
+            }
+            Ok(Event::SubscriptionChanged {
+                name,
+                session,
+                window,
+                window_index,
+                pane,
+                value,
+            })
+        }
         Rule::unlinked_window_add => {
             let mut pairs = pair.into_inner();
             let window = parse_window_id(
@@ -508,6 +550,7 @@ fn parse_line(line: &[u8]) -> Result<Event> {
         | Rule::number
         | Rule::pane_id
         | Rule::session_id
+        | Rule::subscription_name
         | Rule::window_id
         | Rule::window_layout
         | Rule::word => bail!("Should not reach here"),
@@ -808,6 +851,7 @@ fn parse_layout_inner(
             | Rule::session_window_changed
             | Rule::sessions_changed
             | Rule::subscription_changed
+            | Rule::subscription_name
             | Rule::unlinked_window_add
             | Rule::unlinked_window_close
             | Rule::unlinked_window_renamed
@@ -1043,7 +1087,7 @@ here
 %paste-buffer-changed just something
 %paste-buffer-deleted just something else
 %pause %3
-%subscription-changed something we don't handle so far
+%subscription-changed tmux_pane_title $1 @2 3 %4 : vim ~/src
 ";
 
         let mut p = Parser::new();
@@ -1139,10 +1183,123 @@ here
                     buffer: "just something else".to_owned()
                 },
                 Event::Pause { pane: 3 },
-                Event::SubscriptionChanged,
+                Event::SubscriptionChanged {
+                    name: "tmux_pane_title".to_owned(),
+                    session: Some(1),
+                    window: Some(2),
+                    window_index: Some(3),
+                    pane: Some(4),
+                    value: "vim ~/src".to_owned(),
+                },
             ],
             events
         );
+    }
+
+    #[test]
+    fn test_parse_subscription_changed() {
+        // pane-scoped: all fields populated
+        assert_eq!(
+            Event::SubscriptionChanged {
+                name: "tmux_pane_current_path".to_owned(),
+                session: Some(1),
+                window: Some(2),
+                window_index: Some(3),
+                pane: Some(4),
+                value: "/home/wez/src".to_owned(),
+            },
+            parse_line(b"%subscription-changed tmux_pane_current_path $1 @2 3 %4 : /home/wez/src")
+                .unwrap()
+        );
+
+        // session-scoped: window/index/pane are `-`
+        assert_eq!(
+            Event::SubscriptionChanged {
+                name: "tmux_status_left".to_owned(),
+                session: Some(1),
+                window: None,
+                window_index: None,
+                pane: None,
+                value: "[main] 12:00".to_owned(),
+            },
+            parse_line(b"%subscription-changed tmux_status_left $1 - - - : [main] 12:00").unwrap()
+        );
+
+        // empty value (note the trailing space before the empty value)
+        assert_eq!(
+            Event::SubscriptionChanged {
+                name: "tmux_status_right".to_owned(),
+                session: Some(1),
+                window: None,
+                window_index: None,
+                pane: None,
+                value: "".to_owned(),
+            },
+            parse_line(b"%subscription-changed tmux_status_right $1 - - - : ").unwrap()
+        );
+
+        // value containing a colon must be preserved intact
+        assert_eq!(
+            Event::SubscriptionChanged {
+                name: "tmux_status_left".to_owned(),
+                session: Some(1),
+                window: None,
+                window_index: None,
+                pane: None,
+                value: "12:34:56".to_owned(),
+            },
+            parse_line(b"%subscription-changed tmux_status_left $1 - - - : 12:34:56").unwrap()
+        );
+
+        // Real capture (tmux 3.6a): value containing ` : ` must land entirely in
+        // `value`; only the first ` : ` separates the header from the value.
+        assert_eq!(
+            Event::SubscriptionChanged {
+                name: "tmux_pane_title".to_owned(),
+                session: Some(0),
+                window: Some(1),
+                window_index: Some(2),
+                pane: Some(2),
+                value: "my pane : title".to_owned(),
+            },
+            parse_line(b"%subscription-changed tmux_pane_title $0 @1 2 %2 : my pane : title")
+                .unwrap()
+        );
+
+        // Real capture: window-scoped subscription (pane is `-`).
+        assert_eq!(
+            Event::SubscriptionChanged {
+                name: "tmux_win_name".to_owned(),
+                session: Some(0),
+                window: Some(0),
+                window_index: Some(1),
+                pane: None,
+                value: "zsh".to_owned(),
+            },
+            parse_line(b"%subscription-changed tmux_win_name $0 @0 1 - : zsh").unwrap()
+        );
+
+        // Real capture: value carrying tmux format characters (`#[...]`, `=`,
+        // commas, doubled spaces) is preserved verbatim.
+        assert_eq!(
+            Event::SubscriptionChanged {
+                name: "tmux_status_left".to_owned(),
+                session: Some(0),
+                window: None,
+                window_index: None,
+                pane: None,
+                value: "#[bg=#3dd50a,fg=#282a36]  #[fg=#282a36,bg=#3dd50a]".to_owned(),
+            },
+            parse_line(
+                b"%subscription-changed tmux_status_left $0 - - - : \
+                  #[bg=#3dd50a,fg=#282a36]  #[fg=#282a36,bg=#3dd50a]"
+            )
+            .unwrap()
+        );
+
+        // A line that doesn't match the wire format fails to parse; the grammar
+        // enforces the structure.
+        assert!(parse_line(b"%subscription-changed onlyname").is_err());
     }
 
     #[test]

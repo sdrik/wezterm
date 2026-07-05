@@ -2,7 +2,9 @@ use crate::domain::{DomainId, WriterWrapper};
 use crate::localpane::LocalPane;
 use crate::pane::{alloc_pane_id, PaneId};
 use crate::tab::{SplitDirection, SplitRequest, SplitSize, Tab, TabId};
-use crate::tmux::{AttachState, TmuxDomain, TmuxDomainState, TmuxRemotePane, TmuxTab};
+use crate::tmux::{
+    set_user_var_action, AttachState, TmuxDomain, TmuxDomainState, TmuxRemotePane, TmuxTab,
+};
 use crate::tmux_pty::{TmuxChild, TmuxPty};
 use crate::{Mux, MuxNotification, Pane};
 use anyhow::{anyhow, Context};
@@ -219,7 +221,7 @@ impl TmuxDomainState {
             Box::new(writer.clone()),
         );
 
-        Ok(Arc::new(LocalPane::new(
+        let local_pane: Arc<dyn Pane> = Arc::new(LocalPane::new(
             local_pane_id,
             terminal,
             Box::new(child),
@@ -227,7 +229,23 @@ impl TmuxDomainState {
             Box::new(writer),
             self.domain_id,
             "tmux pane".to_string(),
-        )))
+        ));
+
+        // Seed session/window-scoped format subscription values so this pane
+        // shows the current value immediately. tmux only re-emits these on
+        // change, so without this a new tab would have empty values until the
+        // next change (e.g. up to a minute for a clock in status-left).
+        let seed: Vec<(String, String)> = self
+            .session_format_values
+            .lock()
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        for (name, value) in seed {
+            local_pane.perform_actions(vec![set_user_var_action(name, value)]);
+        }
+
+        Ok(local_pane)
     }
 
     pub fn split_pane(

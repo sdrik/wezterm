@@ -77,8 +77,9 @@ As features stabilize some brief notes about them will accumulate here.
 #### New
 * [tmux_format_subscriptions](config/lua/config/tmux_format_subscriptions.md):
   when attached to a `tmux -CC` session (tmux >= 3.2), wezterm can subscribe to
-  tmux format strings (e.g. `#{T:status-left}`, `#{pane_current_path}`) and be
-  notified of their tmux-computed values whenever they change.
+  tmux format strings (e.g. `#{T:status-left}`, `#{pane_current_path}`) and
+  exposes their tmux-computed values as pane user vars, so they can be shown in
+  the wezterm status bar from an `update-status` handler.
 * [wezterm.serde](config/lua/wezterm.serde/index.md) module for serialization
   and deserialization of JSON, TOML and YAML. Thanks to @expnn! #4969
 * `wezterm ssh` now supports agent forwarding. Thanks to @Riatre! #5345

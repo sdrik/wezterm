@@ -15,15 +15,20 @@ draws no status bar of its own. This option lets wezterm subscribe to tmux
 mechanism (`refresh-client -B`, requires **tmux >= 3.2**). tmux then *pushes*
 the recomputed value of each format whenever it changes.
 
-Whenever a subscription's value changes, tmux pushes the recomputed value to
-wezterm, so you can read it from Lua and render it in the status bar.
+Each subscription's latest value is stored as a [pane user
+var](../../../recipes/passing-data-to-wezterm.md) named by `name`, so you can
+read it from Lua — typically in an
+[update-status](../window-events/update-status.md) handler — and render it in
+the wezterm status bar.
 
 Each entry has three fields:
 
-* `name` - the subscription name. Use characters from `[A-Za-z0-9_-]`.
+* `name` - the user var name under which the value is exposed (also the tmux
+  subscription name). Use characters from `[A-Za-z0-9_-]`.
 * `target` - what the format is computed against:
     * `"Session"` (default) - the attached session, e.g. `#{T:status-left}`.
-    * `"Pane"` - every pane in the session.
+    * `"Pane"` - every pane in the session; the value is set on each
+      corresponding wezterm pane.
     * `"Window"` - every window in the session.
 * `format` - the tmux format string, e.g. `#{pane_current_path}`.
 

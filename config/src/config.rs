@@ -17,6 +17,7 @@ use crate::keys::{Key, LeaderKey, Mouse};
 use crate::lua::make_lua_context;
 use crate::ssh::{SshBackend, SshDomain};
 use crate::tls::{TlsDomainClient, TlsDomainServer};
+use crate::tmux::TmuxFormatSubscription;
 use crate::units::Dimension;
 use crate::unix::UnixDomain;
 use crate::wsl::WslDomain;
@@ -360,6 +361,14 @@ pub struct Config {
 
     #[dynamic(default)]
     pub exec_domains: Vec<ExecDomain>,
+
+    /// The set of tmux control-mode format strings to subscribe to when
+    /// attached to a `tmux -CC` session. Each subscription's latest value is
+    /// exposed as a user var (named by `name`) on the relevant pane(s).
+    /// Empty by default; see the docs for an example that surfaces tmux's
+    /// status line in the wezterm status bar.
+    #[dynamic(default)]
+    pub tmux_format_subscriptions: Vec<TmuxFormatSubscription>,
 
     #[dynamic(default)]
     pub serial_ports: Vec<SerialDomain>,

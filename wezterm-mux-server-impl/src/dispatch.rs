@@ -203,6 +203,10 @@ where
                 stream.flush().await.context("flushing PDU to client")?;
             }
             Ok(Item::Notif(MuxNotification::ActiveWorkspaceChanged(_))) => {}
+            // tmux control-mode format subscriptions surface as a GUI-side Lua
+            // event in the process owning the tmux domain; they are not
+            // replicated to remote mux clients.
+            Ok(Item::Notif(MuxNotification::TmuxSubscriptionChanged { .. })) => {}
             Ok(Item::Notif(MuxNotification::Empty)) => {}
             Err(err) => {
                 log::error!("process_async Err {}", err);

@@ -15,16 +15,23 @@ draws no status bar of its own. This option lets wezterm subscribe to tmux
 mechanism (`refresh-client -B`, requires **tmux >= 3.2**). tmux then *pushes*
 the recomputed value of each format whenever it changes.
 
-Whenever a subscription's value changes, tmux pushes the recomputed value to
-wezterm, so you can read it from Lua and render it in the status bar.
+Whenever a subscription's value changes, wezterm emits the
+[tmux-subscription-changed](../window-events/tmux-subscription-changed.md) event,
+carrying the subscription `name`, its new `value`, and the relevant wezterm
+objects (pane/tab/window). Handle it from Lua to render the value in the wezterm
+status bar.
 
 Each entry has three fields:
 
-* `name` - the subscription name. Use characters from `[A-Za-z0-9_-]`.
+* `name` - the subscription name; it is passed to your event handler to identify
+  which value changed. Use characters from `[A-Za-z0-9_-]`.
 * `target` - what the format is computed against:
     * `"Session"` (default) - the attached session, e.g. `#{T:status-left}`.
-    * `"Pane"` - every pane in the session.
-    * `"Window"` - every window in the session.
+      The event fires with `pane = nil`.
+    * `"Pane"` - every pane in the session; the event fires with the
+      corresponding wezterm `pane`.
+    * `"Window"` - every window in the session; the event fires with the
+      corresponding wezterm tab in `meta.tab`.
 * `format` - the tmux format string, e.g. `#{pane_current_path}`.
 
 This option is empty by default; nothing is subscribed until you configure it.

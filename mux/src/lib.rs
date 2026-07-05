@@ -95,6 +95,26 @@ pub enum MuxNotification {
         old_workspace: String,
         new_workspace: String,
     },
+    /// A tmux control-mode format subscription (`refresh-client -B`) reported a
+    /// new value. Carries local ids already resolved from the tmux ids (so the
+    /// GUI doesn't need the tmux maps), plus the raw tmux ids for reference.
+    TmuxSubscriptionChanged {
+        domain_id: DomainId,
+        name: String,
+        value: String,
+        /// Local pane for a Pane-scoped subscription; `None` otherwise.
+        pane_id: Option<PaneId>,
+        /// Local tab for a Window-scoped subscription (a tmux window maps to a
+        /// wezterm tab); `None` otherwise.
+        tab_id: Option<TabId>,
+        /// The single Mux window backing this tmux domain, if known.
+        window_id: Option<WindowId>,
+        /// Raw tmux ids, as carried by the `%subscription-changed` notification.
+        tmux_session: Option<u64>,
+        tmux_window: Option<u64>,
+        tmux_window_index: Option<u64>,
+        tmux_pane: Option<u64>,
+    },
 }
 
 static SUB_ID: AtomicUsize = AtomicUsize::new(0);

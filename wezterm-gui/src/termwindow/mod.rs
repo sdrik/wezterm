@@ -190,6 +190,21 @@ pub struct OverlayState {
     pub key_table_state: KeyTableState,
 }
 
+/// Payload for the `tmux-subscription-changed` Lua event, carried from the
+/// `MuxNotification` of the same name. Local ids are resolved to Lua objects
+/// when the event is emitted; the raw tmux ids are exposed in the `meta` table.
+struct TmuxSubscriptionEvent {
+    name: String,
+    value: String,
+    pane_id: Option<PaneId>,
+    tab_id: Option<TabId>,
+    tmux_session: Option<u64>,
+    tmux_window: Option<u64>,
+    tmux_window_index: Option<u64>,
+    tmux_pane: Option<u64>,
+    domain_id: mux::domain::DomainId,
+}
+
 #[derive(Default)]
 pub struct PaneState {
     /// If is_some(), the top row of the visible screen.
@@ -1201,6 +1216,30 @@ impl TermWindow {
                 } => {
                     self.emit_user_var_event(pane_id, name, value);
                 }
+                MuxNotification::TmuxSubscriptionChanged {
+                    name,
+                    value,
+                    pane_id,
+                    tab_id,
+                    tmux_session,
+                    tmux_window,
+                    tmux_window_index,
+                    tmux_pane,
+                    domain_id,
+                    ..
+                } => {
+                    self.emit_tmux_subscription_changed_event(TmuxSubscriptionEvent {
+                        name,
+                        value,
+                        pane_id,
+                        tab_id,
+                        tmux_session,
+                        tmux_window,
+                        tmux_window_index,
+                        tmux_pane,
+                        domain_id,
+                    });
+                }
                 MuxNotification::WindowTitleChanged { .. }
                 | MuxNotification::Alert {
                     alert:
@@ -1512,6 +1551,12 @@ impl TermWindow {
                 if mux.window_containing_tab(tab_id) == Some(mux_window_id) {
                     // fall through
                 } else {
+                    return true;
+                }
+            }
+            MuxNotification::TmuxSubscriptionChanged { window_id, .. } => {
+                // Only forward to the window backing this tmux domain.
+                if window_id != Some(mux_window_id) {
                     return true;
                 }
             }
@@ -1948,6 +1993,54 @@ impl TermWindow {
 
         promise::spawn::spawn(config::with_lua_config_on_main_thread(move |lua| {
             do_event(lua, name, value, window, pane)
+        }))
+        .detach();
+    }
+
+    fn emit_tmux_subscription_changed_event(&mut self, event: TmuxSubscriptionEvent) {
+        let mux = Mux::get();
+        let window = GuiWin::new(self);
+        // Resolve the local ids (already computed by the mux side) to the Lua
+        // wrapper objects. Absent ones become `nil` on the Lua side.
+        let pane = event
+            .pane_id
+            .and_then(|id| mux.get_pane(id))
+            .map(|p| mux_lua::MuxPane(p.pane_id()));
+        let tab = event.tab_id.map(mux_lua::MuxTab);
+
+        async fn do_event(
+            lua: Option<Rc<mlua::Lua>>,
+            event: TmuxSubscriptionEvent,
+            window: GuiWin,
+            pane: Option<MuxPane>,
+            tab: Option<mux_lua::MuxTab>,
+        ) -> anyhow::Result<()> {
+            if let Some(lua) = lua {
+                let meta = lua.create_table()?;
+                meta.set("tab", tab)?;
+                meta.set("session", event.tmux_session)?;
+                meta.set("tmux_window", event.tmux_window)?;
+                meta.set("window_index", event.tmux_window_index)?;
+                meta.set("tmux_pane", event.tmux_pane)?;
+                meta.set("domain_id", event.domain_id)?;
+
+                let args =
+                    lua.pack_multi((window.clone(), pane, event.name, event.value, meta))?;
+                if let Err(err) = config::lua::emit_event(
+                    &lua,
+                    ("tmux-subscription-changed".to_string(), args),
+                )
+                .await
+                {
+                    log::error!("while processing tmux-subscription-changed event: {:#}", err);
+                }
+            }
+
+            Ok(())
+        }
+
+        promise::spawn::spawn(config::with_lua_config_on_main_thread(move |lua| {
+            do_event(lua, event, window, pane, tab)
         }))
         .detach();
     }

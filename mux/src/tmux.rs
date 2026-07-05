@@ -6,7 +6,7 @@ use crate::tmux_commands::{
     ListAllPanes, ListAllWindows, ListCommands, NewWindow, SplitPane, TmuxCommand,
 };
 use crate::window::WindowId;
-use crate::{Mux, MuxWindowBuilder};
+use crate::{Mux, MuxNotification, MuxWindowBuilder};
 use async_trait::async_trait;
 use filedescriptor::FileDescriptor;
 use parking_lot::{Condvar, Mutex};
@@ -222,6 +222,42 @@ impl TmuxDomainState {
                 }
                 Event::UnlinkedWindowClose { window } => {
                     let _ = self.remove_detached_window(*window);
+                }
+                Event::SubscriptionChanged {
+                    name,
+                    session,
+                    window,
+                    window_index,
+                    pane,
+                    value,
+                } => {
+                    // Resolve the tmux ids to local wezterm ids here, where the
+                    // domain's maps live, then surface the value to Lua via a
+                    // MuxNotification (the GUI turns it into the
+                    // `tmux-subscription-changed` event). Pane-scoped
+                    // subscriptions map to a local pane; window-scoped ones map
+                    // to the local tab backing that tmux window.
+                    let pane_id = pane.and_then(|tmux_pane| {
+                        self.remote_panes
+                            .lock()
+                            .get(&tmux_pane)
+                            .map(|p| p.lock().local_pane_id)
+                    });
+                    let tab_id = window
+                        .and_then(|tmux_window| self.gui_tabs.lock().get(&tmux_window).map(|t| t.tab_id));
+                    let window_id = self.gui_window.lock().as_ref().map(|w| **w);
+                    Mux::get().notify(MuxNotification::TmuxSubscriptionChanged {
+                        domain_id: self.domain_id,
+                        name: name.clone(),
+                        value: value.clone(),
+                        pane_id,
+                        tab_id,
+                        window_id,
+                        tmux_session: *session,
+                        tmux_window: *window,
+                        tmux_window_index: *window_index,
+                        tmux_pane: *pane,
+                    });
                 }
                 _ => {}
             }

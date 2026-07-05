@@ -149,6 +149,9 @@ impl GuiFrontEnd {
                         | Alert::IconTitleChanged(_)
                         | Alert::SetUserVar { .. },
                 } => {}
+                MuxNotification::TmuxSubscriptionChanged { .. } => {
+                    // Handled via TermWindowNotif; NOP it here.
+                }
                 MuxNotification::Empty => {
                     if config::configuration().quit_when_all_windows_are_closed {
                         promise::spawn::spawn_into_main_thread(async move {

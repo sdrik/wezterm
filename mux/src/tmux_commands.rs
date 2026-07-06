@@ -8,7 +8,7 @@ use crate::tmux_pty::{TmuxChild, TmuxPty};
 use crate::{Mux, MuxNotification, Pane};
 use anyhow::{anyhow, Context};
 use parking_lot::{Condvar, Mutex};
-use portable_pty::{MasterPty, PtySize};
+use portable_pty::MasterPty;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Write};
 use std::io::Write as _;
@@ -295,11 +295,29 @@ impl TmuxDomainState {
                 .expect("apply_layout: pane materialized during reconcile")
         });
 
-        // 5) Record the new pane set (used by the global prune).
+        // 5) Record the new pane set (used by the global prune) and sync each
+        // pane's cached geometry + the tab's total size to the layout we just
+        // applied. This is what keeps the resize path loop-free: the
+        // `TabResized` that `sync_with_pane_tree` above emits is handled later,
+        // by which point these caches match, so it is recognised as
+        // steady-state (no `refresh-client` / `resize-pane` bounce-back).
+        {
+            let pane_map = self.remote_panes.lock();
+            for (tmux_pid, cell) in &leaves {
+                if let Some(ref_pane) = pane_map.get(tmux_pid) {
+                    let mut p = ref_pane.lock();
+                    p.pane_width = cell.width;
+                    p.pane_height = cell.height;
+                    p.pane_left = cell.left;
+                    p.pane_top = cell.top;
+                }
+            }
+        }
         {
             let mut gui_tabs = self.gui_tabs.lock();
             if let Some(t) = gui_tabs.get_mut(&window_id) {
                 t.panes = leaves.iter().map(|(pid, _)| *pid).collect();
+                t.last_window_size = Some(size);
             }
         }
 
@@ -378,6 +396,33 @@ impl TmuxDomainState {
         };
 
         self.apply_layout(window_id, &tree, active, zoomed_pane, false)
+    }
+
+    /// Reconcile the cached per-pane geometry in `remote_panes` with the tab's
+    /// current pane rectangles, returning the tmux panes whose size actually
+    /// changed. Keeping the cache in step with the live tab is what lets the
+    /// `TabResized` handler tell a genuine divider drag (cache drifts, emit
+    /// `resize-pane`) from the interim resizes of a whole-window resize (cache
+    /// kept fresh, nothing to emit) without bouncing spurious `resize-pane`s.
+    fn sync_pane_cache_from_tab(&self, tab: &Tab) -> Vec<(TmuxPaneId, usize, usize)> {
+        let panes = tab.iter_panes_ignoring_zoom();
+        let mut changed = Vec::new();
+        let pane_map = self.remote_panes.lock();
+        for pos in &panes {
+            let local_id = pos.pane.pane_id();
+            if let Some((tmux_pid, ref_pane)) = pane_map
+                .iter()
+                .find(|(_, p)| p.lock().local_pane_id == local_id)
+            {
+                let mut p = ref_pane.lock();
+                if p.pane_width != pos.width as u64 || p.pane_height != pos.height as u64 {
+                    p.pane_width = pos.width as u64;
+                    p.pane_height = pos.height as u64;
+                    changed.push((*tmux_pid, pos.width, pos.height));
+                }
+            }
+        }
+        changed
     }
 
     /// Track the active pane for a window (from `%window-pane-changed`) and, if
@@ -560,6 +605,7 @@ impl TmuxDomainState {
                         panes: HashSet::new(),
                         active_pane: None,
                         history_limit: window.history_limit,
+                        last_window_size: None,
                     },
                 );
             } else {
@@ -695,6 +741,91 @@ impl TmuxDomainState {
                                         window_id: window_id,
                                     },
                                 ));
+                                TmuxDomainState::schedule_send_next_command(domain_id);
+                            }
+                        }
+                    }
+                    MuxNotification::TabResized(tab_id) => {
+                        let Some(tab) = mux.get_tab(tab_id) else {
+                            return;
+                        };
+                        // Only act on tabs backed by this tmux domain.
+                        let tmux_window_id = tmux_domain
+                            .inner
+                            .gui_tabs
+                            .lock()
+                            .iter()
+                            .find(|(_, t)| t.tab_id == tab_id)
+                            .map(|(_, t)| t.tmux_window_id);
+                        let Some(tmux_window_id) = tmux_window_id else {
+                            return;
+                        };
+
+                        let size = tab.get_size();
+
+                        // A whole-window resize changes the tab's total size; a
+                        // divider drag keeps it constant. Distinguish per tab so
+                        // that, when several tabs resize together, we never
+                        // mistake a sibling for a divider.
+                        let prev = tmux_domain
+                            .inner
+                            .gui_tabs
+                            .lock()
+                            .get(&tmux_window_id)
+                            .and_then(|t| t.last_window_size);
+                        let window_resized = match prev {
+                            Some(p) => p.cols != size.cols || p.rows != size.rows,
+                            None => true,
+                        };
+
+                        if window_resized {
+                            if let Some(t) =
+                                tmux_domain.inner.gui_tabs.lock().get_mut(&tmux_window_id)
+                            {
+                                t.last_window_size = Some(size);
+                            }
+                            // Keep the per-pane cache in step with the live tab
+                            // so an interim `TabResized` during this same window
+                            // resize is not mistaken for a divider drag (which
+                            // would emit spurious `resize-pane`s). No command
+                            // here: tmux re-lays-out from `refresh-client -C` and
+                            // reports back via `%layout-change`.
+                            tmux_domain.inner.sync_pane_cache_from_tab(&tab);
+                            // `refresh-client -C` is client-level: emit it once
+                            // per distinct client size even if multiple tabs
+                            // report the same new size.
+                            let mut last_client = tmux_domain.inner.last_client_size.lock();
+                            let need = match *last_client {
+                                Some(c) => c.cols != size.cols || c.rows != size.rows,
+                                None => true,
+                            };
+                            if need {
+                                *last_client = Some(size);
+                                drop(last_client);
+                                tmux_domain.inner.cmd_queue.lock().push_back(Box::new(
+                                    RefreshClientSize {
+                                        cols: size.cols,
+                                        rows: size.rows,
+                                    },
+                                ));
+                                TmuxDomainState::schedule_send_next_command(domain_id);
+                            }
+                        } else {
+                            // Divider drag / keyboard pane adjustment: total
+                            // unchanged but pane proportions moved. Push each
+                            // pane whose size drifted from tmux's last-known
+                            // geometry; tmux reconciles via %layout-change.
+                            let changed = tmux_domain.inner.sync_pane_cache_from_tab(&tab);
+                            if !changed.is_empty() {
+                                let mut cmd_queue = tmux_domain.inner.cmd_queue.lock();
+                                for (pane_id, cols, rows) in changed {
+                                    cmd_queue.push_back(Box::new(ResizePane {
+                                        pane_id,
+                                        cols,
+                                        rows,
+                                    }));
+                                }
+                                drop(cmd_queue);
                                 TmuxDomainState::schedule_send_next_command(domain_id);
                             }
                         }
@@ -929,85 +1060,68 @@ impl TmuxCommand for ListAllWindows {
     }
 }
 
+/// Push our client size (in cells) to tmux via `refresh-client -C`. tmux
+/// recomputes each window's layout to fit and reports the result back as
+/// `%layout-change`, which `apply_layout` applies — so this command carries no
+/// per-pane geometry of its own. Used at attach (so the initial `list-windows`
+/// layouts are already correctly sized) and on every whole-window resize.
 #[derive(Debug)]
-pub(crate) struct Resize {
-    pub pane_id: TmuxPaneId,
-    pub size: PtySize,
+pub(crate) struct RefreshClientSize {
+    pub cols: usize,
+    pub rows: usize,
 }
 
-impl TmuxCommand for Resize {
+impl TmuxCommand for RefreshClientSize {
     fn get_command(&self, domain_id: DomainId) -> String {
         let mux = Mux::get();
-        let domain = match mux.get_domain(domain_id) {
-            Some(d) => d,
-            None => return "".to_string(),
+        let Some(domain) = mux.get_domain(domain_id) else {
+            return String::new();
         };
-        let tmux_domain = match domain.downcast_ref::<TmuxDomain>() {
-            Some(t) => t,
-            None => return "".to_string(),
-        };
-
-        // Not in stable state for now, don't do resizing, otherwise it will cause tmux output
-        // unexpected content.
-        if *tmux_domain.inner.attach_state.lock() == AttachState::Init {
-            return "".to_string();
-        }
-
-        let pane_map = tmux_domain.inner.remote_panes.lock();
-        {
-            let mut pane = match pane_map.get(&self.pane_id) {
-                Some(x) => x.lock(),
-                None => return "".to_string(),
-            };
-
-            if pane.pane_width == self.size.cols as u64 && pane.pane_height == self.size.rows as u64
-            {
-                return "".to_string();
-            } else {
-                pane.pane_width = self.size.cols as u64;
-                pane.pane_height = self.size.rows as u64;
-            }
-        }
-
-        let tmux_window_id = match pane_map.get(&self.pane_id) {
-            Some(x) => x.lock().window_id,
-            None => return "".to_string(),
-        };
-
-        let gui_tabs = tmux_domain.inner.gui_tabs.lock();
-        let local_tab = match gui_tabs.get(&tmux_window_id) {
-            Some(t) => t,
-            None => return "".to_string(),
-        };
-
-        let size = match mux.get_tab(local_tab.tab_id) {
-            Some(x) => x.get_size(),
-            None => return "".to_string(),
+        let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() else {
+            return String::new();
         };
 
         let support_commands = tmux_domain.inner.support_commands.lock();
-
-        if let Some(_x) = support_commands.get("resize-window") {
-            format!(
-                "resize-window -x {} -y {} -t @{}\nresize-pane -x {} -y {} -t %{}\n",
-                size.cols, size.rows, tmux_window_id, self.size.cols, self.size.rows, self.pane_id
-            )
-        } else if let Some(x) = support_commands.get("refresh-client") {
-            if x.contains("-C XxY") {
-                format!(
-                    "refresh-client -C {}x{}\nresize-pane -x {} -y {} -t %{}\n",
-                    size.cols, size.rows, self.size.cols, self.size.rows, self.pane_id
-                )
-            } else {
-                format!(
-                    "refresh-client -C {},{}\nresize-pane -x {} -y {} -t %{}\n",
-                    size.cols, size.rows, self.size.cols, self.size.rows, self.pane_id
-                )
+        match support_commands.get("refresh-client") {
+            // The accepted argument shape changed across tmux versions: older
+            // builds document `-C XxY`, newer ones `-C X,Y`.
+            Some(x) if x.contains("-C XxY") => {
+                format!("refresh-client -C {}x{}\n", self.cols, self.rows)
             }
-        } else {
-            log::info!("The tmux version is not supported");
-            return "".to_string();
+            Some(_) => format!("refresh-client -C {},{}\n", self.cols, self.rows),
+            None => {
+                log::info!("tmux does not support `refresh-client -C`; cannot push client size");
+                String::new()
+            }
         }
+    }
+
+    fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()> {
+        if result.error {
+            let error = format!("refresh-client in domain={domain_id} failed: {result:#?}");
+            log::error!("{error}");
+            anyhow::bail!("{error}");
+        }
+        Ok(())
+    }
+}
+
+/// Resize a single tmux pane, used to propagate a local divider drag (or
+/// keyboard pane-size adjustment) that changes pane proportions without
+/// changing the window's total size. tmux reconciles via `%layout-change`.
+#[derive(Debug)]
+pub(crate) struct ResizePane {
+    pub pane_id: TmuxPaneId,
+    pub cols: usize,
+    pub rows: usize,
+}
+
+impl TmuxCommand for ResizePane {
+    fn get_command(&self, _domain_id: DomainId) -> String {
+        format!(
+            "resize-pane -x {} -y {} -t %{}\n",
+            self.cols, self.rows, self.pane_id
+        )
     }
 
     fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()> {
@@ -1147,6 +1261,27 @@ impl TmuxCommand for ListCommands {
 
         let mut cmd_queue = tmux_domain.inner.cmd_queue.as_ref().lock();
         if let Some(session) = *tmux_domain.inner.tmux_session.lock() {
+            // Push our real client size before enumerating windows, so the
+            // `list-windows` layouts come back already sized to this client
+            // rather than to whatever size the session last had. Any
+            // %layout-change tmux emits in response arrives before the
+            // list-windows reply and is harmlessly ignored (the tabs do not
+            // exist yet).
+            if let Some(pane) = mux.get_pane(tmux_domain.inner.pane_id) {
+                let dims = pane.get_dimensions();
+                let cols = dims.cols;
+                let rows = dims.viewport_rows;
+                if cols > 0 && rows > 0 {
+                    *tmux_domain.inner.last_client_size.lock() = Some(TerminalSize {
+                        rows,
+                        cols,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                        dpi: 0,
+                    });
+                    cmd_queue.push_back(Box::new(RefreshClientSize { cols, rows }));
+                }
+            }
             cmd_queue.push_back(Box::new(ListAllWindows {
                 session_id: session,
                 window_id: None,

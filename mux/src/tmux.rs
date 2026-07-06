@@ -65,6 +65,11 @@ pub(crate) struct TmuxTab {
     pub active_pane: Option<TmuxPaneId>,
     /// The window's scrollback limit, used when capturing newly discovered panes.
     pub history_limit: isize,
+    /// The tab's total size as last observed (either applied from a tmux layout
+    /// or pushed to tmux). Used to tell a whole-window resize (total changes)
+    /// apart from a divider drag (total unchanged) when a `%layout-change`-free
+    /// `TabResized` fires.
+    pub last_window_size: Option<TerminalSize>,
 }
 
 pub(crate) type TmuxCmdQueue = VecDeque<Box<dyn TmuxCommand>>;
@@ -78,6 +83,10 @@ pub(crate) struct TmuxDomainState {
     pub remote_panes: Mutex<HashMap<TmuxPaneId, RefTmuxRemotePane>>,
     pub tmux_session: Mutex<Option<TmuxSessionId>>,
     pub support_commands: Mutex<HashMap<String, String>>,
+    /// The client size (in cells) last pushed to tmux via `refresh-client -C`.
+    /// Coalesces the `refresh-client` emitted when several tabs resize together
+    /// in response to a single window resize.
+    pub last_client_size: Mutex<Option<TerminalSize>>,
     pub attach_state: Mutex<AttachState>,
     /// Promises awaiting the local pane that results from a user-initiated
     /// split; resolved (FIFO) with the local `PaneId` once the split's
@@ -424,6 +433,7 @@ impl TmuxDomain {
             remote_panes: Mutex::new(HashMap::default()),
             tmux_session: Mutex::new(None),
             support_commands: Mutex::new(HashMap::default()),
+            last_client_size: Mutex::new(None),
             attach_state: Mutex::new(AttachState::Init),
             pending_splits: Mutex::new(VecDeque::default()),
             backlog: Mutex::new(HashMap::default()),

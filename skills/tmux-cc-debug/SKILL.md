@@ -1,9 +1,9 @@
 ---
-name: wezterm-tmux-debug
+name: tmux-cc-debug
 description: Use when debugging or developing wezterm's tmux control-mode (tmux -CC) integration — reproducing/instrumenting layout-change, detach, teardown, or child-wake behaviour. Spawns an ISOLATED tmux+wezterm-gui test pair (dedicated socket, empty config, dedicated window class + XDG_RUNTIME_DIR) so tests never touch the real wezterm/tmux session Claude runs inside. Provides log/CC-traffic capture and state snapshots, plus a heisenbug-safe quiet mode.
 ---
 
-# wezterm-tmux-debug
+# tmux-cc-debug
 
 Helps develop and debug wezterm's **tmux control-mode (CC)** integration
 (`mux/src/tmux*.rs`, `wezterm-escape-parser/src/tmux_cc/`) without disturbing the
@@ -54,7 +54,7 @@ default to the latest run.
 **reproduce → instrument → snapshot → diff wez/tmux → cleanup**
 
 ```bash
-S="${CLAUDE_PLUGIN_ROOT}/skills/wezterm-tmux-debug/scripts"
+S="${CLAUDE_PLUGIN_ROOT}/skills/tmux-cc-debug/scripts"
 RUN=$("$S"/spawn-test-wezterm.sh --worktree /home/cedric/work/wezterm/main)
 # ... trigger the behaviour in the test window (split, detach, resize, ...) ...
 "$S"/snapshot-state.sh --run-id "$RUN"

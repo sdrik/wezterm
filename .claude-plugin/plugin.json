@@ -1,6 +1,6 @@
 {
   "name": "wezterm",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Development and debugging tools for the WezTerm terminal emulator.",
   "author": {
     "name": "Cédric Schieli",

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Shared helpers + ISOLATION INVARIANTS for the wezterm-tmux-debug skill.
+# Shared helpers + ISOLATION INVARIANTS for the tmux-cc-debug skill.
 # Sourced by every other script. Never run directly.
 #
 # Invariants enforced here (non-negotiable):
@@ -62,7 +62,7 @@ resolve_binaries() {  # $1 = worktree path
 # Persist everything downstream scripts need so RUN_ID is the only handle.
 write_run_meta() {  # writes $RUN_DIR/meta.env from current vars
   cat >"$RUN_DIR/meta.env" <<EOF
-# wezterm-tmux-debug run metadata
+# tmux-cc-debug run metadata
 RUN_ID='$RUN_ID'
 WORKTREE='$WORKTREE'
 BIN_GUI='$BIN_GUI'
